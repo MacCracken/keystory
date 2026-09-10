@@ -18,7 +18,7 @@ phase boundary.
 | # | Phase | Scope | Status |
 |---|-------|-------|--------|
 | 1 | Crash-resilient single-node KV engine | RCU snapshots, segmented WAL, durable checkpoint + recovery, Jepsen-lite checker | **DONE** ✅ |
-| 2 | Fault-tolerant replicated store (Raft) | leader election, replicated log, quorum/commit, failover, partition tolerance | planned |
+| 2 | Fault-tolerant replicated store (Raft) | leader election, replicated log, quorum/commit, failover, partition tolerance | **DONE** |
 | 3 | Production-grade I/O | log-structured storage, zero-copy/mmap, efficient snapshots, large-value handling | planned |
 | 4 | Async end-to-end + async I/O | async runtime + async-safe API; revisit RCU reclamation | planned |
 
@@ -130,23 +130,89 @@ There is no `rust-toolchain.toml` pin yet; the build is assumed on the host rust
 
 ---
 
-## Phase 2 — Fault-tolerant replicated store (Raft) — planned
+## Phase 2 — Fault-tolerant replicated store (Raft) — **DONE**
 
-Intended scope (design intent, not yet built):
+A dependency-free, *in-process, synchronous* Raft driver layered over the Phase-1 durable
+store. The protocol **logic** is the real Raft; the **transport** is a stand-in: peers are
+called by hand on one thread's call stack (no sockets, no async, no election timers). The
+`Model` linearisability oracle from Phase 1 is reused and re-validated across nodes and a
+`std::thread` workload. See `ROADMAP.md` and `src/raft/cluster.rs`'s module docs for the
+precise guarantees proven and the ones deliberately not yet proven.
 
-- A multi-node cluster built on the Phase-1 durable store; each node uses the same
-  WAL/checkpoint machinery as its *local* log.
-- **Leader election + heartbeat** (Raft terms — the `term` field is already reserved).
-- **Replicated log + quorum commit.** An entry commits when a majority ack it, and that
-  commit advances the published RCU snapshot on every node.
-- **Failover + partition tolerance.** Leader-loss elections, split-brain avoidance via
-  quorum, and a network-partition test that proves a minority does not commit.
-- Extend the `Model` checker to span *multiple* nodes' histories — the *real* Jepsen-lite
-  linearisability proof that the Phase-1 checker only prefigures.
+### Design decisions
 
-**Decision points to raise before building:** wire-protocol framing, log-compaction
-strategy, and whether the node transport is TCP or a unix socket (Phase 4's async may
-dictate this).
+- **Protocol, not transport.** `RequestVote` + majority election, `AppendEntries` + the
+  log-matching property, commit only on a whole-cluster majority. `Node` is a pure,
+  deterministic state machine (term, vote, log, commit index, applied index, FSM view).
+- **Elections are deterministic.** `elect` picks the live node with the *most up-to-date*
+  log (higher last-log-term wins, tie-broken by lowest id) -- a stand-in for randomised
+  timers. A stale node (behind log) cannot win even at a higher term (Raft's
+  log-matching property), so a restarted node cannot clobber durable history.
+- **Quorum is whole-cluster, not live.** Commit requires `n/2 + 1` of all `n` nodes
+  *alive and acking*. A minority partition cannot elect or commit -- the partition-tolerance
+  property, proved directly by the `minority_partition_cannot_commit` test.
+- **Replication is synchronous inside the client call.** `put` blocks until the entry is
+  replicated + committed + applied at every live node, then records it in the `Model` at its
+  global commit index. Reads serve the leader's converged view and *assert convergence*
+  across all live nodes. This is "synchronous replication": correct, just not async.
+- **The in-memory log is the *only* source of truth across the cluster.** Each node keeps a
+  `Vec` log and applies committed entries to its own `BTreeMap` FSM via the Phase-1
+  `Op::apply`. No node checkpointing yet -- a node is reconstructed from the log; this is the
+  Phase-3 storage decision (open #2), not a Raft correctness concern.
+- **`Model` reuse.** The Phase-1 `Model`/`CheckModel` oracle is *the* linearisability
+  checker for Phase 2 too: each commit records a write at its global index, each read
+  observes that index's value, and the same `check()` proves a single total order -- now
+  across a live cluster and a multi-threaded workload.
+
+### Components
+
+| File | LOC | Role |
+| --- | ---: | --- |
+| `src/raft/node.rs` | 537 | FSM core: `Term`, `Node`, `LogEntry`, `Op`, `State(BTreeMap)`; `request_vote`, `append_entries` (log-matching + truncation), `advance_commit` (quorum), `apply_committed`, `propose`, `start_election`, `become_leader`; 6 unit tests |
+| `src/raft/cluster.rs` | 399 | `RaftCluster` driver: `elect`, `cluster_put`/`cluster_delete` (propose to quorum), `get` (leader read + convergence assert), `fail`/`revive`, optional shared `Model`; 3 unit tests |
+| `src/raft/mod.rs` | 18 | Module: re-exports `RaftCluster`, `ClusterError`, node types |
+| `tests/replication.rs` | 171 | Convergence, single-leader-death failover (no lost update), minority-partition-cannot-commit + no split-brain, and a 12-client concurrent linearisability check |
+
+### Threat & failure audit (Phase 2) -- proven
+
+- **No lost updates across failover.** `failover_preserves_committed_state` (+ the unit
+  test): kill the leader *mid-workload*, keep writing; every committed value is present and
+  the `Model` records **zero violations**. This is the killer of "restart-loses-everything"
+  for a single node, now promoted to a cluster.
+- **No split-brain commit.** A minority (below quorum) cannot elect a leader or commit
+  (`minority_partition_cannot_commit`): its `put` returns `NoLeader`, and its value is
+  nowhere in the cluster -- two minority partitions cannot both commit.
+- **Convergence.** Every committed write earns one global index and every live node applies
+  it; `get` asserts all live nodes agree.
+- **Deterministic elections.** `stale_log_cannot_win_even_at_a_higher_term` proves a behind
+  node loses even with a higher term (Raft's log-matching property in the election).
+- **Log-matching repair.** `log_mismatch_is_corrected` proves a divergent follower tail is
+  truncated on `AppendEntries` (the core of eventual log agreement).
+- **Cross-node + concurrent linearisability.** `concurrent_writers_and_readers_stay_linearizable`
+  runs 12 client threads on a 3-node cluster; the `Model` finds zero violations -- the exact
+  sequential-consistency invariant Phase 1 proved single-node, now proven *replicated*.
+
+### Honest limitations (Phase 2) -- not yet covered
+
+- **No real network / no async.** Peers are called in-process by hand; there is no socket
+  framing, no heartbeat timer, and no async pipeline. "Fault" means a node flagged in the
+  driver's `down` set, not a real network partition with two separated, independently
+  electing sub-clusters. (This is the open async-transport question, Phase 4.)
+- **In-memory logs; no node checkpoint.** Each node's log is a `Vec` that is not persisted;
+  a *node* crash (vs. whole-machine) is not yet modelled -- recovery is "reconstruct from
+  log", and that storage decision (in-place vs log-structured, open #2) is Phase 3.
+- **Synchronous replication.** `put` blocks through the quorum; not a leader-pipelined async
+  write path.
+- **The `Model` remains a *linearisability* (single-total-order) oracle**, not a full Jepsen
+  consistency suite (no read-your-writes, no causal reads, no linearization-of-snapshots).
+
+**Evidence:** 39 lib unit tests + 4 replication integration + 3 crash + 1 Jepsen-lite =
+47 tests pass; clippy clean under `-Dwarnings`; 0 dependencies; 0 `unsafe`.
+
+**Decision points to raise before Phase 3:** log-compaction strategy; the node storage
+backend (in-place vs log-structured -- open #2); and whether the *transport*, when it
+arrives, is TCP or a unix socket (which Phase 4's async may make moot).
+
 
 ## Phase 3 — Production-grade I/O — planned
 

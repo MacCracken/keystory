@@ -10,6 +10,7 @@ pub mod types;
 pub mod wal;
 pub mod snapshot;
 pub mod engine;
+pub mod raft;
 pub mod checker;
 
 /// Re-export the public entry point at the crate root.
