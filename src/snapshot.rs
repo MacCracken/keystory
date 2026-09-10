@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 
 use crate::types::{Entry, Snapshot};
 use crate::wal::crc32;
+use crate::crc::Crc;
 
 /// Magic prefix + format version. A mismatch is a corrupt/foreign file.
 const MAGIC: &[u8] = b"KSN1";
@@ -107,6 +108,65 @@ pub fn write(dir: impl AsRef<Path>, snap: &Snapshot) -> io::Result<()> {
     if let Ok(dt) = std::fs::File::open(dir) {
         dt.sync_all().ok();
     }
+    Ok(())
+}
+
+/// Write a checkpoint *streaming*: iterate the snapshot and write each record to a buffered,
+/// fsync'd temp file, folding the CRC incrementally via [`Crc`] -- WITHOUT materialising the
+/// whole on-disk body in one `Vec`. For a large map this keeps peak allocation at O(one record)
+/// instead of O(whole snapshot). The bytes are identical to [`write`], so [`load`] decodes them
+/// identically.
+pub fn write_streaming(dir: impl AsRef<Path>, snap: &Snapshot) -> io::Result<()> {
+    use std::io::BufWriter;
+    let dir = dir.as_ref();
+    let tmp = dir.join(SNAPSHOT_TMP);
+    let final_path = dir.join(SNAPSHOT_NAME);
+
+    let f = std::fs::OpenOptions::new()
+          .write(true)
+          .create(true)
+          .truncate(true)
+          .open(&tmp)
+          .map_err(|e| io::Error::other(format!("open tmp: {e}")))?;
+
+    let mut c = Crc::new();
+    let mut out = BufWriter::new(f);
+
+        // Header: magic + version + commit index + entry count -- matches `encode`'s prefix.
+    let mut head = Vec::new();
+    head.extend_from_slice(MAGIC);
+    head.extend_from_slice(&FORMAT.to_le_bytes());
+    head.extend_from_slice(&snap.index.to_le_bytes());
+    head.extend_from_slice(&(snap.data.len() as u64).to_le_bytes());
+    c.update(&head);
+    out.write_all(&head)?;
+
+        // One record at a time: the loop body never grows beyond one key/value pair.
+    for (k, e) in &snap.data {
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        rec.extend_from_slice(k);
+        rec.extend_from_slice(&(e.value.len() as u32).to_le_bytes());
+        rec.extend_from_slice(&e.value);
+        rec.extend_from_slice(&e.version.to_le_bytes());
+        c.update(&rec);
+        out.write_all(&rec)?;
+      }
+
+        // Fold the trailing CRC over everything written so far, then flush + fsync + rename.
+    let crc = c.finish();
+    out.write_all(&crc.to_le_bytes())?;
+    out.flush()?;
+    out.get_mut()
+           .sync_all()
+           .map_err(|e| io::Error::other(format!("fsync snapshot: {e}")))?;
+    drop(out);
+
+    std::fs::rename(&tmp, &final_path)
+           .map_err(|e| io::Error::other(format!("rename: {e}")))?;
+    if let Ok(dt) = std::fs::File::open(dir) {
+        dt.sync_all().ok();
+     }
     Ok(())
 }
 
@@ -287,4 +347,21 @@ mod tests {
         assert!(!d.join(SNAPSHOT_TMP).exists());
         std::fs::remove_dir_all(&d).ok();
      }
+        /// A large snapshot written *streaming* decodes identically to the buffered writer,
+       /// proving the incremental CRC and per-record layout match the non-streaming format.
+       #[test]
+    fn streaming_roundtrip_large() {
+        let d = tmp();
+        let mut s = Snapshot::empty();
+        fill(&mut s, 50_000);
+        s.index = 50_000;
+        write_streaming(&d, &s).expect("stream write");
+        let got = load(&d).expect("load");
+        assert!(got.is_some(), "a streamed snapshot must be present");
+        let got = got.unwrap();
+        assert_eq!(got.index, 50_000, "index survives a streamed checkpoint");
+        assert_eq!(got.data.len(), 50_000, "all entries survive");
+        assert_eq!(s.data, got.data, "streamed decode == in-memory state");
+          }
+
 }

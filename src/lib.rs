@@ -9,6 +9,9 @@ pub mod rcu;
 pub mod types;
 pub mod wal;
 pub mod snapshot;
+
+mod crc;
+pub mod valuestore;
 pub mod engine;
 pub mod raft;
 pub mod checker;

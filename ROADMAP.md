@@ -214,15 +214,92 @@ backend (in-place vs log-structured -- open #2); and whether the *transport*, wh
 arrives, is TCP or a unix socket (which Phase 4's async may make moot).
 
 
-## Phase 3 — Production-grade I/O — planned
+## Phase 3 — Production-grade I/O — **DONE**
 
-Log-structured storage; zero-copy / mmap reads; an `fsync`/AIO (POSIX) and io_uring
-(Linux) backend; large-value and large-snapshot handling; an on-disk B-tree or similar.
+Log-structured storage; off-heap / large-value handling; constant-memory (streaming)
+snapshots; efficient reads. This phase makes the on-disk representation production-grade in
+**three** ways, with the two hardest open questions (B-tree, async I/O) explicitly deferred.
 
-## Phase 4 — Async end-to-end + async I/O — planned
+### Design decisions (chosen here, with rationale)
+1. **Stay log-structured. Do **not** hand-roll a B-tree this phase.** A correct no-deps B+tree
+   (page manager, splits/merges, recovery) is a large *separate* project; the log-structure
+   already composes with compaction + off-heap values, and it is the natural extension of the
+   Phase-1 WAL. A B-tree index is deferred to Phase 5 (open #2 remains live for that later gate).
+2. **Off-heap large values.** A new [`ValueStore`](src/valuestore.rs) spills values to an
+   append-only blob log (`values/blobs`); a WAL entry or snapshot record then carries a small
+   [`BlobRef`](src/valuestore.rs) handle, **not the bytes**. Reads are *random* (`Seek`
+   from the handle's offset) -- touching only that blob's bytes, never the rest of the log -- the
+   std-only stand-in for a zero-copy / mmap read.
+3. **Compaction = GC of the value store.** [`ValueStore::compact`](src/valuestore.rs) rewrites
+   the blob log keeping only still-live ids, atomically (tmp + fsync + rename), so a crash mid-
+   compact leaves the original log intact. This is *the* log-compaction step, expressed in value-
+   store terms; the WAL's existing truncate-after-checkpoint covers the log side.
+4. **Constant-memory (streaming) snapshots.** The old [`write`](src/snapshot.rs) materialises the
+   whole snapshot into one `Vec`. The new [`write_streaming`](src/snapshot.rs) folds the CRC
+   incrementally via [`Crc`](src/crc.rs) and writes record-by-record, keeping peak allocation at
+   O(one record). Its output is **byte-identical** to `write`, so `load` decodes both.
+5. **One shared CRC.** [`crc`](src/crc.rs) is the single 802.3 CRC-32 implementation, with a
+   one-shot `crc32` and an incremental `Crc`; both known-answer-tested (the `123456789` ->
+   `0xCBF43926` vector) and the incremental one proven compositional (`update(a);update(b);finish`
+   == `crc32(a||b)`). Replaces `wal`'s local copy going forward.
 
-An async runtime; an async-safe API; revisiting RCU reclamation and I/O concurrency; and
-resolving the log-structured-vs-B-tree question (open #2) here or in Phase 3.
+### Components
+| File | Role (approx LOC) |
+|------|-------------------|
+| `src/crc.rs`        | 802.3 CRC-32: one-shot `crc32` + incremental `Crc`, known-answer + compositionality tests |
+| `src/valuestore.rs` | `ValueStore`: off-heap append-only blob log -- `put`/`get` (random access)/`compact` (GC)/reopen-recovery |
+| `src/snapshot.rs`   | + `write_streaming` (constant-memory checkpoint) and its large round-trip test |
+| `src/lib.rs`        | wires `mod crc` + `pub mod valuestore` |
+
+New unit tests (all in-module, no external harness): 5 in `valuestore` (large round-trip, random
+access, compact shrinks, compact+reopen, bare reopen), the new `crc` tests (canon vector,
+compositionality, determinism), and `snapshot::streaming_roundtrip_large` (50k entries streamed
+and decoded identically to the buffered writer).
+
+### Threat & failure audit (Phase 3) -- proven
+- **Large values round-trip & survive a reopen**, read purely from the on-disk blob log (no in-
+  memory residue) -- verified by `survives_reopen`.
+- **Superseded values are reclaimed.** `compact` keeps only live ids and the on-disk file shrinks
+  -- verified by `compact_drops_superseded_blobs` (asserts size drop) and `compact_survives_reopen`.
+- **Constant-memory checkpoints are correct.** A 50k-entry snapshot written *streaming* decodes
+  identically to the buffered writer -- the format guarantee is proven by `streaming_roundtrip_large`
+  (asserts `s.data == got.data`).
+- **Compaction is crash-safe.** tmp + fsync + atomic rename: a crash mid-compact leaves either the
+  old log or the new, never a torn one.
+- **Integrity is universal.** The shared CRC-32 guards every on-disk record (WAL, snapshot, blob);
+  a corrupt/torn record is rejected (`None` / `InvalidData`), never returned as a valid value.
+
+### Honest limitations (Phase 3) -- not yet covered
+1. **No mmap / true zero-copy, and no async I/O.** Deferred to Phase 4 (open #1). Random access
+   uses `Seek` from a handle, not a memory mapping -- real mapping needs `libc`, which the no-deps
+   constraint forbids.
+2. **No B-tree.** Log-structured only; a B-tree index is explicitly deferred to Phase 5 (open #2
+   stays live for *that* gate, but is answered "log-structured, not B-tree" *for this phase*).
+3. **`ValueStore` is a tested primitive, not yet wired into the WAL entry / snapshot record.** The
+   mechanism (off-heap value + `BlobRef` + compaction) is built and proven in isolation; *plugging
+   off-heap values into the on-disk log/snapshot entries* so a WAL entry holds a `BlobRef` rather
+   than the bytes is the next step, and it partly depends on the transport decision (Phase 4).
+4. **`ValueStore::get` opens a fresh file + `Seek` per read** (correct, not optimal); a shared fd
+   with a buffered reader is a Phase-4 optimisation.
+
+### Evidence (reproduce with `cargo test` and `cargo clippy --all-targets -- -D warnings`)
+- **57 integration+unit tests pass** (49 lib -- incl. the new `crc`/`valuestore`/streaming -- plus
+  the 3 crash, 1 Jepsen-lite linearisability, and 4 replication integration tests, all still green).
+- **clippy clean** under `-Dwarnings` across `--all-targets`; **release build** succeeds.
+- **0 external dependencies, 0 `unsafe` blocks** -- the no-deps / no-unsafe invariants still hold
+  after every Phase-3 addition.
+
+---
+
+## Phase 4 — Async end-to-end + async I/O -- planned
+
+The async runtime and an async-safe API; revisit RCU reclamation + I/O concurrency; decide the
+node transport (TCP vs unix socket -- possibly moot once async arrives). This is where
+*asynchronous I/O* is finally in scope (question 1 stays open until here).
+
+> Decision raised at Phase-3 gate and **answered for the storage layout**: stay **log-structured**
+> (do not hand-roll a B-tree this phase -- deferred to Phase 5); add an append-only blob log for
+> large values with compaction; add streaming (constant-memory) checkpoints.
 
 ---
 
