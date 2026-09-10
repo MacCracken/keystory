@@ -1,14 +1,18 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! This crate is intentionally dependency-free (std-only), Phase 1 of a Raft-modelled
+//! crash-resilient, replicated KV store built in ordered phases.
+//! No external crates, no consensus library: the WAL, RCU snapshot and engine are written
+//! from scratch in this phase.
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::doc_lazy_continuation)] // long module-doc prose uses continuation lines
+#![warn(clippy::all)]
+pub mod rcu;
+pub mod types;
+pub mod wal;
+pub mod snapshot;
+pub mod engine;
+pub mod checker;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+/// Re-export the public entry point at the crate root.
+pub use engine::Store;
+/// Re-export the core value/op types for ergonomic `use keystore::...`.
+pub use types::{Entry, Op, Snapshot};
