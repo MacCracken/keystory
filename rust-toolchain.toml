@@ -1,0 +1,16 @@
+# Toolchain pin -- reproducibility (the one open gap the ROADMAP still notes).
+#
+# This project was developed and its `cargo test`/`cargo clippy` runs were
+# validated against a specific compiler. Pin the *exact* toolchain so a fresh
+# checkout builds bit-for-bit what was tested: the compiler's version can matter
+# for `no_std`/`unsafe` semantics, lint availability, and deterministic builds.
+#
+# The crate itself declares a *minimum* in `Cargo.toml` (`rust-version = "1.80"`);
+# this file declares the *pinned* toolchain used for development and CI. They are
+# complementary: `rust-version` is a floor, this is the actual pin.
+#
+# Install once: `rustup toolchain install 1.98.1 --profile minimal`.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

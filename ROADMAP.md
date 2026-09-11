@@ -124,10 +124,15 @@ rustc 1.98.1 · 0 external dependencies · 0 unsafe · clippy --all-targets: 0 w
   jepsen-lite     1   (8 writers × 64 keys × 100 writes + 6 readers, 0 consistency violations)
 ```
 
-### Note on reproducibility (open)
+### Note on reproducibility (resolved in Phase 5)
 
-There is no `rust-toolchain.toml` pin yet; the build is assumed on the host rustc
-(observed 1.98.1). Pinning the toolchain is small hygiene to owe to any later phase.
+Resolved: `rust-toolchain.toml` pins the exact development toolchain
+(`channel = "1.98.1"`, with `rustfmt` + `clippy`, `profile = "minimal"`), so a
+fresh checkout builds what was tested. It complements the `rust-version = "1.80"`
+floor in `Cargo.toml` -- the floor is the minimum a consumer needs; the pin is the
+compiler the project's `cargo test` / `cargo clippy --all-targets -- -D warnings`
+runs were validated against. (A fresh checkout auto-installs the pinned toolchain
+via rustup, or installs it once with `rustup toolchain install 1.98.1`.)
 
 ---
 
