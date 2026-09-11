@@ -16,8 +16,11 @@
 //! (Phase 2/3). Here we prove a single node is internally coherent -- the necessary
 //! precondition for any replicated system to be correct.
 
-use keystore::checker::{CheckModel, Model};
-use keystore::Store;
+mod common;
+
+use common::TempDir;
+use keystory::checker::{CheckModel, Model};
+use keystory::Store;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -36,20 +39,12 @@ fn xorshift(mut x: u64) -> u64 {
     x
 }
 
-/// A cheap per-test-unique counter so concurrent run dirs don't collide.
-fn uid() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering as O};
-    static N: AtomicU64 = AtomicU64::new(0);
-    N.fetch_add(1, O::Relaxed)
-}
-
 #[test]
 fn concurrent_writers_and_readers_are_sequentially_consistent() {
-    let dir = std::env::temp_dir().join(format!("ks-li-{}-{}", std::process::id(), uid()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
+    let tmp = TempDir::new("linearisability");
+    let dir = tmp.path();
 
-    let store = Arc::new(Store::open(&dir).expect("open store"));
+    let store = Arc::new(Store::open(dir).expect("open store"));
     let model = Arc::new(Model::new());
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -78,11 +73,7 @@ fn concurrent_writers_and_readers_are_sequentially_consistent() {
                 let p = store
                     .put(key.as_bytes(), final_str.as_bytes())
                     .expect("reput");
-                model.record_write(
-                    p,
-                    key.clone(),
-                    Some(final_str.clone().into_bytes()),
-                );
+                model.record_write(p, key.clone(), Some(final_str.clone().into_bytes()));
             }
         }));
     }
@@ -92,7 +83,9 @@ fn concurrent_writers_and_readers_are_sequentially_consistent() {
         let store = Arc::clone(&store);
         let model = Arc::clone(&model);
         let stop = Arc::clone(&stop);
-        let mut seed = (r as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut seed = (r as u64)
+            .wrapping_add(1)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
         handles.push(thread::spawn(move || {
             for _ in 0..READS_PER_READER {
                 if stop.load(Ordering::Relaxed) {
@@ -121,7 +114,10 @@ fn concurrent_writers_and_readers_are_sequentially_consistent() {
         "sequential-consistency violations detected:\n{:#?}",
         res.violations
     );
-    assert!(res.checked > 0, "the test recorded no reads -- it did nothing");
+    assert!(
+        res.checked > 0,
+        "the test recorded no reads -- it did nothing"
+    );
 
     // 2) Final state: exactly one writer owns each key, so its final value is
     //    deterministic and recoverable.
@@ -137,24 +133,21 @@ fn concurrent_writers_and_readers_are_sequentially_consistent() {
 
     // 3) Durability: checkpoint, then reopen the same final state.
     store.checkpoint().expect("checkpoint");
-    let reopened = Store::open(&dir).expect("reopen");
+    let reopened = Store::open(dir).expect("reopen");
     assert_eq!(reopened.len(), KEYS as usize, "final recovered set size");
 
     // 4) A focused lost-update check with interleaved writers on one key.
     bump_and_check_lost_updates();
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One key, N interleaved writers (NOT a single owner): each commits an incrementing
 /// integer. The commit index total-orders them; the offline checker must find zero
 /// violations, and the final recovered value must be a genuine written value.
 fn bump_and_check_lost_updates() {
-    let dir = std::env::temp_dir().join(format!("ks-lu-{}-{}", std::process::id(), uid()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
+    let tmp = TempDir::new("lost-update");
+    let dir = tmp.path();
 
-    let store = Arc::new(Store::open(&dir).expect("open"));
+    let store = Arc::new(Store::open(dir).expect("open"));
     let model = Arc::new(Model::new());
     let n = 5u32;
     let mut hs = Vec::new();
@@ -181,18 +174,20 @@ fn bump_and_check_lost_updates() {
 
     // Independently: one live key whose value was a genuine write.
     let finalv = store.get(b"hot").expect("hot present");
-    assert!(std::str::from_utf8(&finalv).is_ok(), "value is a written string");
+    assert!(
+        std::str::from_utf8(&finalv).is_ok(),
+        "value is a written string"
+    );
     assert_eq!(store.len(), 1, "exactly one live key");
 
     // Durability across a simulated crash: checkpoint, then a WAL tail, reopen.
     store.checkpoint().expect("checkpoint hot");
     let tail = "w9_9999";
     store.put(b"hot", tail.as_bytes()).expect("tail put");
-    let reopened = Store::open(&dir).expect("reopen after crash");
+    let reopened = Store::open(dir).expect("reopen after crash");
     assert_eq!(
         reopened.get(b"hot"),
         Some(tail.as_bytes().to_vec()),
         "WAL tail recovered"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::raft::{ClusterError, RaftCluster};
-use crate::rt::{Scheduler, yield_once};
+use crate::rt::{yield_once, Scheduler};
 
 /// Run a single `'static` async workload to completion on a fresh cooperative scheduler.
 ///
@@ -26,39 +26,39 @@ use crate::rt::{Scheduler, yield_once};
 /// `.await` resolves. This is the honest "async end-to-end" entry point.
 pub fn run<F>(work: F) -> F::Output
 where
-     F: std::future::Future + 'static,
-     F::Output: Send + 'static,
-     {
-     Scheduler::new().block_on(work)
-      }
+    F: std::future::Future + 'static,
+    F::Output: Send + 'static,
+{
+    Scheduler::new().block_on(work)
+}
 
 /// Replicated put through the async API: model the async boundary, then apply synchronous quorum
 /// replication. Returns the committed index. Behaves identically to [`RaftCluster::put`], but
 /// reached the async way; the wired `Model` is checked exactly as in the synchronous driver.
 pub async fn put(
-     cluster: Arc<RaftCluster>,
-     key: Vec<u8>,
-     val: Vec<u8>,
-       ) -> Result<u64, ClusterError> {
-       // Model the I/O boundary (no real source yet) so the .await is genuinely driven.
+    cluster: Arc<RaftCluster>,
+    key: Vec<u8>,
+    val: Vec<u8>,
+) -> Result<u64, ClusterError> {
+    // Model the I/O boundary (no real source yet) so the .await is genuinely driven.
     yield_once().await;
     cluster.put(&key, &val)
-      }
+}
 
 /// Replicated read through the async API; `None` if the key was never written or was deleted.
 pub async fn get(cluster: Arc<RaftCluster>, key: Vec<u8>) -> Result<Option<Vec<u8>>, ClusterError> {
-     yield_once().await;
-     cluster.get(&key)
-       }
+    yield_once().await;
+    cluster.get(&key)
+}
 
 /// Replicated scan over a key prefix through the async API.
 pub async fn scan(
-     cluster: Arc<RaftCluster>,
-     prefix: Vec<u8>,
-       ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ClusterError> {
-     yield_once().await;
-     cluster.scan(&prefix)
-       }
+    cluster: Arc<RaftCluster>,
+    prefix: Vec<u8>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ClusterError> {
+    yield_once().await;
+    cluster.scan(&prefix)
+}
 
 #[cfg(test)]
 mod test {
@@ -67,75 +67,83 @@ mod test {
     use crate::raft::RaftCluster;
     use std::sync::Arc;
 
-        /// A whole async workload -- many puts, then reads -- runs on the cooperative runtime and
-        /// converges exactly like the synchronous driver, with the shared Model reporting zero
-        /// linearisability violations.
-        #[test]
+    /// A whole async workload -- many puts, then reads -- runs on the cooperative runtime and
+    /// converges exactly like the synchronous driver, with the shared Model reporting zero
+    /// linearisability violations.
+    #[test]
     fn async_workload_converges() {
         let model = Arc::new(Model::new());
         let cluster = Arc::new(RaftCluster::with_model(3, model.clone()));
         let cluster_check = cluster.clone();
 
-         // One async block, driven by the runtime.
+        // One async block, driven by the runtime.
         run(async move {
-           for i in 0..60u64 {
-               let c = cluster_check.clone();
-               let key: Vec<u8> = vec![b'k', i as u8];
-               let val: Vec<u8> = vec![b'v', i as u8];
+            for i in 0..60u64 {
+                let c = cluster_check.clone();
+                let key: Vec<u8> = vec![b'k', i as u8];
+                let val: Vec<u8> = vec![b'v', i as u8];
                 put(c, key, val).await.unwrap();
-              }
+            }
             for _ in 0..20 {
-                 let c = cluster_check.clone();
-                 let got = get(c, vec![b'k', 0u8]).await.unwrap();
-                 assert_eq!(got, Some(vec![b'v', 0u8]));
-                }
-              });
+                let c = cluster_check.clone();
+                let got = get(c, vec![b'k', 0u8]).await.unwrap();
+                assert_eq!(got, Some(vec![b'v', 0u8]));
+            }
+        });
 
         let r = model_check_check(&model);
-        assert!(r.violations.is_empty(), "async workload must be linearizable");
+        assert!(
+            r.violations.is_empty(),
+            "async workload must be linearizable"
+        );
         assert!(r.checked > 0, "we recorded reads to validate");
-     }
+    }
 
-        /// An async workload that fails over mid-run still converges -- async changes nothing about
-        /// the Raft guarantee; the Model stays clean.
-        #[test]
+    /// An async workload that fails over mid-run still converges -- async changes nothing about
+    /// the Raft guarantee; the Model stays clean.
+    #[test]
     fn async_failover_then_converges() {
         let model = Arc::new(Model::new());
         let cluster = Arc::new(RaftCluster::with_model(3, model.clone()));
 
         let c1 = cluster.clone();
         run(async move {
-             for i in 0..30u64 {
-                 let c = c1.clone();
-                 let key: Vec<u8> = vec![b'f', i as u8];
-                 let val: Vec<u8> = vec![b'f', i as u8];
-                 put(c, key, val).await.unwrap();
-                  }
-              });
+            for i in 0..30u64 {
+                let c = c1.clone();
+                let key: Vec<u8> = vec![b'f', i as u8];
+                let val: Vec<u8> = vec![b'f', i as u8];
+                put(c, key, val).await.unwrap();
+            }
+        });
 
-              // Force failover: kill node 3 (the deterministic leader), then keep writing through
-              // a new leader.
+        // Force failover: kill node 3 (the deterministic leader), then keep writing through
+        // a new leader.
         cluster.fail(3);
-        assert!(cluster.leader().is_some(),
-        "a quorum (2 of 3) remains, so a leader re-emerges");
+        assert!(
+            cluster.leader().is_some(),
+            "a quorum (2 of 3) remains, so a leader re-emerges"
+        );
 
         let c2 = cluster.clone();
         run(async move {
-             for i in 0..20u64 {
-                 let c = c2.clone();
-                 let key: Vec<u8> = vec![b'g', i as u8];
-                 let val: Vec<u8> = vec![b'g', i as u8];
-                 put(c.clone(), key, val).await.unwrap();
-                 let _ = get(c, vec![b'x', 1u8]).await.unwrap();
-                  }
-              });
+            for i in 0..20u64 {
+                let c = c2.clone();
+                let key: Vec<u8> = vec![b'g', i as u8];
+                let val: Vec<u8> = vec![b'g', i as u8];
+                put(c.clone(), key, val).await.unwrap();
+                let _ = get(c, vec![b'x', 1u8]).await.unwrap();
+            }
+        });
 
         let r = model_check_check(&model);
-        assert!(r.violations.is_empty(), "post-failover async workload must be linearizable");
-     }
+        assert!(
+            r.violations.is_empty(),
+            "post-failover async workload must be linearizable"
+        );
+    }
 
-      /// Run the shared Model's linearisability check.
-     fn model_check_check(model: &Arc<Model>) -> crate::checker::CheckResult {
+    /// Run the shared Model's linearisability check.
+    fn model_check_check(model: &Arc<Model>) -> crate::checker::CheckResult {
         model.check()
-        }
+    }
 }

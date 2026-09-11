@@ -3,8 +3,8 @@
 //! A tiny executable used by the crash-recovery integration test. Two sub-commands:
 //!
 //! * `run <dir> [n]`    open the store at `dir`, durably (WAL-fsync'd) commit `n`
-//!   keys, write a `CHILD_DONE` marker in that directory, then **block** so the parent
-//!   may kill it at will.
+//!   keys (default 1000), write a `CHILD_DONE` marker in that directory, then
+//!   **block** so the parent may kill it at will.
 //! * `verify <dir> <n>` re-open the same store *fresh* and assert that all `n` keys are
 //!   present with the exact values written before the crash; print `OK`.
 //!
@@ -16,7 +16,7 @@
 //! Std-only: the signal is delivered by shelling out to the OS `kill(1)` utility, so we
 //! take no `libc` dependency (honouring the Phase-1 "no dependencies" constraint).
 
-use keystore::Store;
+use keystory::Store;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
@@ -91,31 +91,38 @@ fn verify(dir: &Path, n: u64) {
     }
 }
 
-fn parse_n(a: &str, default: u64) -> u64 {
-    a.parse().unwrap_or(default)
+fn usage() -> ! {
+    eprintln!("usage: keystory-crash-runner run <dir> [n]   (n defaults to 1000)");
+    eprintln!("       keystory-crash-runner verify <dir> <n>");
+    exit(2);
+}
+
+/// Parse the optional key count; `default` is used when the argument is absent, and a
+/// sub-command with no default requires it.
+fn parse_n(arg: Option<&String>, default: Option<u64>) -> u64 {
+    match (arg, default) {
+        (Some(s), _) => s.parse().unwrap_or_else(|_| {
+            eprintln!("invalid key count {s:?}");
+            exit(2)
+        }),
+        (None, Some(d)) => d,
+        (None, None) => usage(),
+    }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let sub = args.get(1).map(|s| s.as_str());
-    match sub {
-        Some("run") => {
-            let dir = PathBuf::from(args[2].clone());
-            let n = parse_n(args.get(3).map(|s| s.as_str()).unwrap_or("0"), 1000);
-            run(&dir, n);
-        }
-        Some("verify") => {
-            let dir = PathBuf::from(args[2].clone());
-            let n = parse_n(args.get(3).map(|s| s.as_str()).unwrap_or("0"), 0);
-            verify(&dir, n);
-        }
+    let dir = match args.get(2) {
+        Some(d) => PathBuf::from(d),
+        None => usage(),
+    };
+    match args.get(1).map(String::as_str) {
+        Some("run") => run(&dir, parse_n(args.get(3), Some(1000))),
+        Some("verify") => verify(&dir, parse_n(args.get(3), None)),
         Some(other) => {
-            eprintln!("unknown sub-command {other:?}; expected `run <dir> [n]` or `verify <dir> <n>`");
-            exit(2);
+            eprintln!("unknown sub-command {other:?}");
+            usage();
         }
-        None => {
-            eprintln!("usage: keystore-crash-runner <run|verify> <dir> [n]");
-            exit(2);
-        }
+        None => usage(),
     }
 }

@@ -1,7 +1,7 @@
 # keystory — roadmap & design log
 
 A crash-resilient, replicated key/value store in Rust, modelled on Raft and built in
-four ordered phases. Each phase must compile, pass its tests, and pause for approval
+ordered phases. Each phase must compile, pass its tests, and pause for approval
 before the next begins. The guiding principle established in Phase 1: be **honest**
 about the threat model — say what is proven and what is not yet, and do not pre-empt
 the design questions a later phase exists to answer.
@@ -10,8 +10,8 @@ the design questions a later phase exists to answer.
 
 A correct, durable, *linearizable* replicated KV store that survives process crashes,
 node failures and network partitions, and that can run over async I/O. Built from
-scratch, dependency-free, with a written audit of the threat/failure model at every
-phase boundary.
+scratch (std-only through Phase 4; `mio` is the single dependency since Phase 5), with
+a written audit of the threat/failure model at every phase boundary.
 
 ## Phases
 
@@ -22,9 +22,11 @@ phase boundary.
 | 3 | Production-grade I/O | log-structured storage, zero-copy/mmap, efficient snapshots, large-value handling | **DONE** ✅ |
 | 4 | Async end-to-end + async I/O | async runtime + async-safe API; revisit RCU reclamation | **DONE** |
 | 5 | Production-grade async I/O + B-tree + true RCU | B+ page store, epoch-based RCU, real non-blocking I/O (via `mio`) | **DONE** ✅ |
+| 6 | Consolidation | act on the 2026-09-11 review: hygiene, confirmed bugs, design gaps, Raft on the durable store | **in progress** |
 
 Legend: **DONE** = compiles, tests green, audit written, approval given. **planned** =
-design intent only, not yet implemented.
+design intent only, not yet implemented. Phase sections are a log: each *Evidence* block
+records the state at that gate (test counts, dependency and `unsafe` counts), not today's.
 
 ---
 
@@ -67,7 +69,7 @@ mechanism and a Jepsen-lite linearisability checker.
 | `src/snapshot.rs` | ~290 | compact binary checkpoint; atomic publish (tmp + fsync + rename); `purge()` |
 | `src/engine.rs` | ~389 | `Store`: commit-lock → WAL + fsync → RCU publish; `open` = snapshot + WAL tail |
 | `src/checker.rs` | ~193 | offline MVCC sequential-consistency checker (`Model`, `CheckModel`) |
-| `src/main.rs` | ~121 | `keystore-crash-runner` for the SIGKILL integration test |
+| `src/main.rs` | ~121 | `keystory-crash-runner` for the SIGKILL integration test |
 | `tests/` | ~379 | crash-recovery (×3) plus a Jepsen-lite linearisability test (×1) |
 
 ### Threat & failure audit
@@ -138,8 +140,9 @@ via rustup, or installs it once with `rustup toolchain install 1.98.1`.)
 
 ## Phase 2 — Fault-tolerant replicated store (Raft) — **DONE**
 
-A dependency-free, *in-process, synchronous* Raft driver layered over the Phase-1 durable
-store. The protocol **logic** is the real Raft; the **transport** is a stand-in: peers are
+A dependency-free, *in-process, synchronous* Raft driver that reuses the Phase-1 `Op` and
+`Model` types. It does **not** use the durable `Store` (nodes keep in-memory logs and state;
+that integration is Phase 6 work). The protocol **logic** is the real Raft; the **transport** is a stand-in: peers are
 called by hand on one thread's call stack (no sockets, no async, no election timers). The
 `Model` linearisability oracle from Phase 1 is reused and re-validated across nodes and a
 `std::thread` workload. See `ROADMAP.md` and `src/raft/cluster.rs`'s module docs for the
@@ -497,6 +500,79 @@ deleted, ascending). `btree_store` carries 9 tests incl. `deleted_key_vanishes_.
 `rust-toolchain.toml` pins the development toolchain (`1.98.1`, with `rustfmt` +
 `clippy`), so a fresh checkout builds what was tested. It complements the
 `rust-version = "1.80"` floor in `Cargo.toml`.
+
+---
+
+## Phase 6 — Consolidation (review of 2026-09-11) — **in progress**
+
+A full read of the codebase plus throwaway probe tests confirmed a set of bugs and
+gaps the phase gates missed. This phase works through them in three batches; each
+item is ticked as it lands.
+
+### Batch 1 — hygiene and quick wins — **DONE** ✅
+
+- [x] `cargo fmt` applied to the whole tree and enforced in CI.
+- [x] `README.md`, `LICENSE-MIT` / `LICENSE-APACHE` and a CI workflow (rustfmt, clippy
+      `-D warnings`, rustdoc `-D warnings`, tests on Linux + macOS, MSRV check) added;
+      the stray `rustup-init.sh` removed from the repository.
+- [x] Package renamed `keystore` → `keystory` to match the repository and this document
+      (binary: `keystory-crash-runner`).
+- [x] `rust-version` corrected to `1.81` (the lint `reason = "..."` attributes in
+      `src/rt.rs` require it); verified with `cargo +1.81 check --all-targets`.
+- [x] `mio` bumped 0.8 → 1.x; the Unix-only `asyncio` module gated with `#[cfg(unix)]`
+      so the crate builds on Windows.
+- [x] Stale docs corrected (crate description, `lib.rs`, `engine`, `rt`, `rcu`, `types`,
+      `snapshot`, `valuestore`, `btree_store`, `raft`); rustdoc builds warning-free.
+- [x] Duplication removed: one CRC-32 (`crc.rs`; the WAL's private copy is gone), one
+      snapshot body encoder (`snapshot::write_body`, streamed by default), one replicated
+      commit path (`cluster::cluster_commit` behind `put` and `delete`).
+- [x] Dead code and small defects: `checker::observed_keys`, duplicated `#[cfg(test)]`
+      attributes, unused temp dirs in two B-tree tests; the crash runner no longer panics
+      on a missing `<dir>` and `run` really defaults to 1000 keys; integration tests use a
+      `tests/common::TempDir` guard so failed runs do not leak directories.
+
+### Batch 2 — confirmed bugs — planned
+
+- [ ] `Store::open` deletes the WAL before anything re-persists the recovered state:
+      reopening twice without a checkpoint loses every WAL-recovered key.
+- [ ] The B-tree range index can panic (an emptied leaf is lifted as a separator after
+      deletes), poisoning the commit lock and bricking the store; its `range` is an O(N)
+      walk (about 800× slower than `BTreeMap::range` at 200k keys). Decision pending:
+      fix, or drop the index and serve ranges from the snapshot map.
+- [ ] The Jepsen-lite test stops its readers immediately (about 12% of the intended
+      reads run).
+- [ ] `RaftCluster::get` panics after `revive` (a revived node counts as live before it
+      is caught up).
+- [ ] `async_failover_then_converges` fails node id 3 in a 3-node cluster (ids 0..2), so
+      nothing fails over.
+- [ ] Crash tests only kill the child after all writes are durable; add a mid-write kill
+      with a prefix-consistency check.
+
+### Batch 3 — design gaps — planned
+
+- [ ] Raft is not layered on the durable engine (nodes keep in-memory logs and state).
+- [ ] Every replicated write runs a full election (`ensure_leader` always elects), so the
+      term climbs by one per write.
+- [ ] Raft FSM deviations: `voted_for` is reset on every `AppendEntries`; no conflict
+      check at `prev_index + 1` on append (a redelivered message corrupts the log); the
+      mismatch path truncates the matching entry itself.
+- [ ] Per-commit deep clone of the whole map, values included (17 ms per put measured at
+      100k keys × 1 KiB). Cheapest mitigation: `Arc<[u8]>` values; real fix: a
+      structurally shared persistent map.
+- [ ] One `fsync` per put and no batch API; group commit is the largest available win.
+- [ ] WAL and checkpoint durability details: no directory `fsync` on segment create or
+      rotate; corruption in a non-final segment is treated like a torn tail;
+      `checkpoint()` blocks writers for the whole write; a corrupt snapshot has no older
+      generation to fall back to.
+- [ ] `rt`: the `wake` vtable entry leaks its `RawWaker` data (std requires `wake` to
+      release it); task slots never compact; `add` from inside a task deadlocks.
+- [ ] `asyncio::round_trip` never times out (loops on an empty poll) and never sets the
+      sockets non-blocking; `register_readable` panics on failure.
+- [ ] `ValueStore`: compaction renumbers ids (invalidating every outstanding `BlobRef`),
+      releases its lock mid-rewrite (a concurrent `put` is lost), and trusts the on-disk
+      length before allocating.
+- [ ] `epoch_rcu::Rcu` is not `Sync` (it stores `Arc<Box<dyn Any>>`), so it cannot be
+      shared across threads; the checker assumes per-key writes arrive in index order.
 
 ---
 

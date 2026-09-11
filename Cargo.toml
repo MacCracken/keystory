@@ -1,27 +1,29 @@
 [package]
-name = "keystore"
+name = "keystory"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
-description = "Crash-resilient, replicated KV store engine modeled on Raft (Phase 1: single-node)."
+# Minimum supported Rust version, verified in CI with `cargo +1.81 check --all-targets`.
+# The `reason = "..."` lint attributes in src/rt.rs are what set the floor.
+rust-version = "1.81"
+description = "Crash-resilient key/value store engine: fsync'd segmented WAL, atomic checkpoints, RCU snapshot reads, an in-process Raft driver and a hand-rolled cooperative runtime."
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 
-# Phase 1-4 were std-only (no third-party libraries: no consensus, no async
-# runtime). Phase 5 (3/3) deliberately lifts that gate -- and ONLY that gate --
-# for real, non-blocking I/O via `mio`. Nothing else is added: no consensus
-# crate, no async runtime, no RPC. mio is the single external dependency.
+# Dependency policy. Phases 1-4 were std-only. Phase 5 lifted that gate exactly once,
+# for real non-blocking event-driven I/O via `mio` (see src/asyncio.rs). Nothing else
+# is added: no consensus crate, no async runtime, no RPC layer, no serde.
 [dependencies]
-# Phase 5 (3/3): real, non-blocking event-driven I/O. The one external
-# dependency; see src/asyncio.rs for how it is used and why it is the only one.
-mio = { version = "0.8", features = ["os-ext"] }
+mio = { version = "1", features = ["os-ext"] }
 
 [lib]
-name = "keystore"
+name = "keystory"
 crate-type = ["rlib"]
 
 [[bin]]
-name = "keystore-crash-runner"
+name = "keystory-crash-runner"
 path = "src/main.rs"
 
 [profile.release]
+# Keep full debug info in release builds so profiles and backtraces are symbolised.
+# Set `strip = true` (or drop this) for distribution binaries.
 debug = 2

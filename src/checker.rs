@@ -18,7 +18,7 @@
 //! cluster. That is Phase 2/3 (Raft). What we prove here is that a *single* node
 //! never violates sequential consistency on its own -- the prerequisite for any
 //! replication to be correct.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// A value written by an op: either stored bytes, or "deleted/absent".
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,7 +38,7 @@ pub struct WriteRec {
 /// A recorded read event: `(commit_index_of_snapshot_read, key, value_observed)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadRec {
-     /// The index of the snapshot the value was read from.
+    /// The index of the snapshot the value was read from.
     pub read_index: u64,
     pub key: Vec<u8>,
     pub value: Option<Vec<u8>>,
@@ -55,53 +55,53 @@ type IndexedWrite = (u64, Stored);
 
 #[derive(Default)]
 pub struct Model {
-     /// key -> writes, kept sorted ascending by commit index.
+    /// key -> writes, kept sorted ascending by commit index.
     writes: std::sync::Mutex<BTreeMap<Vec<u8>, Vec<IndexedWrite>>>,
-     /// Global log of every read observation, in any order.
+    /// Global log of every read observation, in any order.
     reads: std::sync::Mutex<Vec<ReadRec>>,
 }
 
 impl Model {
-     /// New, empty model.
+    /// New, empty model.
     pub fn new() -> Self {
         Model::default()
-        }
+    }
 
-       /// Record a write to `key` at `commit_index` storing `value` (or delete).
+    /// Record a write to `key` at `commit_index` storing `value` (or delete).
     pub fn record_write(&self, index: u64, key: impl Into<Vec<u8>>, value: Option<Vec<u8>>) {
         let k = key.into();
         let stored = match value {
             Some(v) => Stored::Present(v),
             None => Stored::Deleted,
-          };
+        };
         let mut w = self.writes.lock().expect("writes mutex poisoned");
         w.entry(k).or_default().push((index, stored));
-        }
+    }
 
-       /// Record a read of `key` at `read_index` observing `value`
-       /// (`None` = absent/deleted at that snapshot).
+    /// Record a read of `key` at `read_index` observing `value`
+    /// (`None` = absent/deleted at that snapshot).
     pub fn record_read(&self, read_index: u64, key: impl Into<Vec<u8>>, value: Option<Vec<u8>>) {
         let mut r = self.reads.lock().expect("reads mutex poisoned");
         r.push(ReadRec {
             read_index,
             key: key.into(),
             value,
-          });
-        }
+        });
+    }
 }
 
 /// The result of validating a workload's recorded reads.
 #[derive(Debug, Default, Clone)]
 pub struct CheckResult {
-     /// Reads whose observed value did NOT match the expected MVCC value.
+    /// Reads whose observed value did NOT match the expected MVCC value.
     pub violations: Vec<(ReadRec, Option<Vec<u8>>)>,
-     /// Number of reads checked.
+    /// Number of reads checked.
     pub checked: usize,
 }
 
 /// A trait so the checker has a clean, testable seam.
 pub trait CheckModel {
-     /// Validate every recorded read against the per-key write logs.
+    /// Validate every recorded read against the per-key write logs.
     fn check(&self) -> CheckResult;
 }
 
@@ -112,39 +112,33 @@ impl CheckModel for Model {
         let mut result = CheckResult {
             violations: Vec::new(),
             checked: reads.len(),
-          };
+        };
         for r in reads.iter() {
-             // Expected = value of the latest write to this key at index <= read_index,
-              // or None if the latest such write was a delete / none has happened.
-            let expected = match writes.get(&r.key) {
-                None => None,
-                Some(log) => log
-                          .iter()
-                          .rev()
-                          .find(|(i, _)| *i <= r.read_index)
-                          .and_then(|(_, stored)| match stored {
-                                Stored::Present(v) => Some(v.clone()),
-                                Stored::Deleted => None,
-                              }),
-              };
+            // Expected = value of the latest write to this key at index <= read_index,
+            // or None if the latest such write was a delete / none has happened.
+            let expected =
+                match writes.get(&r.key) {
+                    None => None,
+                    Some(log) => log.iter().rev().find(|(i, _)| *i <= r.read_index).and_then(
+                        |(_, stored)| match stored {
+                            Stored::Present(v) => Some(v.clone()),
+                            Stored::Deleted => None,
+                        },
+                    ),
+                };
             if r.value != expected {
                 result.violations.push((r.clone(), expected));
-              }
-             }
-        result
+            }
         }
-}
-
-/// Distinct keys observed by a set of read/write logs (for reporting the test matrix).
-pub fn observed_keys(keys: &[Vec<u8>]) -> BTreeSet<Vec<u8>> {
-    keys.iter().cloned().collect()
+        result
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-       #[test]
+    #[test]
     fn consistent_history_passes() {
         let m = Model::new();
         m.record_write(1, b"k", Some(b"v1".to_vec()));
@@ -155,12 +149,12 @@ mod tests {
         m.record_read(3, b"k", None); // absent (deleted by index 3)
         m.record_read(0, b"k", None); // before any write: absent
         assert!(m.check().violations.is_empty());
-        }
+    }
 
-       #[test]
+    #[test]
     fn a_stale_but_valid_read_passes() {
-         // A reader that observes v1 at index 1 even though v3 is "current" is FINE:
-         // MVCC snapshot-read consistency permits reading a past snapshot.
+        // A reader that observes v1 at index 1 even though v3 is "current" is FINE:
+        // MVCC snapshot-read consistency permits reading a past snapshot.
         let m = Model::new();
         m.record_write(1, b"k", Some(b"v1".to_vec()));
         m.record_write(2, b"k", Some(b"v2".to_vec()));
@@ -168,19 +162,23 @@ mod tests {
         m.record_read(1, b"k", Some(b"v1".to_vec()));
         m.record_read(3, b"k", Some(b"v3".to_vec()));
         assert!(m.check().violations.is_empty());
-        }
+    }
 
-       #[test]
+    #[test]
     fn an_inconsistent_read_is_caught() {
         let m = Model::new();
         m.record_write(1, b"k", Some(b"v1".to_vec()));
         m.record_write(2, b"k", Some(b"v2".to_vec()));
-         // A read at index 2 must see v2, not some unrecorded value:
+        // A read at index 2 must see v2, not some unrecorded value:
         m.record_read(2, b"k", Some(b"vBROKEN".to_vec()));
-        assert_eq!(m.check().violations.len(), 1, "the bad read must be flagged");
-        }
+        assert_eq!(
+            m.check().violations.len(),
+            1,
+            "the bad read must be flagged"
+        );
+    }
 
-       #[test]
+    #[test]
     fn delete_then_reread_reflects_absence() {
         let m = Model::new();
         m.record_write(1, b"k", Some(b"v1".to_vec()));
@@ -189,5 +187,5 @@ mod tests {
         m.record_read(2, b"k", None); // absent at index 2
         m.record_read(3, b"k", None); // still absent (no newer write)
         assert!(m.check().violations.is_empty());
-        }
+    }
 }

@@ -22,14 +22,7 @@
 //! The non-blocking path is Unix in this iteration (a Unix-stream pair needs no
 //! network and is fully self-contained); the module is Unix-only.
 
-use mio::{
-     unix::SourceFd,
-     event::Source,
-     Events,
-     Interest,
-     Poll,
-     Token,
-};
+use mio::{event::Source, unix::SourceFd, Events, Interest, Poll, Token};
 
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -45,53 +38,57 @@ pub struct Reactor {
 impl Reactor {
     /// Create a new reactor with a fresh platform poller.
     pub fn new() -> Result<Reactor, std::io::Error> {
-        Ok(Reactor { poller: Poll::new()?, next: 1 })
-     }
+        Ok(Reactor {
+            poller: Poll::new()?,
+            next: 1,
+        })
+    }
 
-     /// Register one end's fd for readiness, returning an opaque token. The kernel
-     /// keeps the registration keyed by the fd after this returns, so the handle
-     /// stays observable.
+    /// Register one end's fd for readiness, returning an opaque token. The kernel
+    /// keeps the registration keyed by the fd after this returns, so the handle
+    /// stays observable.
     pub fn register_readable(&mut self, b: &UnixStream) -> Token {
-            let t = Token(self.next);
-            self.next += 1;
-             // Keep a live fd value the wrapper can borrow; the kernel-keyed
-             // registration persists past the borrow.
-            let fd = b.as_raw_fd();
-            let mut sf = SourceFd(&fd);
-             // `event::Source::register` is the documented pattern.
-            sf.register(self.poller.registry(), t, Interest::READABLE).expect("live fd");
-            t
-         }
+        let t = Token(self.next);
+        self.next += 1;
+        // Keep a live fd value the wrapper can borrow; the kernel-keyed
+        // registration persists past the borrow.
+        let fd = b.as_raw_fd();
+        let mut sf = SourceFd(&fd);
+        // `event::Source::register` is the documented pattern.
+        sf.register(self.poller.registry(), t, Interest::READABLE)
+            .expect("live fd");
+        t
+    }
 
-          /// Drive one real, non-blocking round trip: `write` on `peer`, then `poll`
-          /// for `token` to be readable, then `read` bytes off `reader`. Returns the
-          /// number of bytes the non-blocking read returned.
+    /// Drive one real, non-blocking round trip: `write` on `peer`, then `poll`
+    /// for `token` to be readable, then `read` bytes off `reader`. Returns the
+    /// number of bytes the non-blocking read returned.
     pub fn round_trip(
-            &mut self,
-            token: Token,
-            peer: &mut UnixStream,
-            reader: &mut UnixStream,
-            payload: &[u8],
-            timeout: Duration,
-         ) -> Result<usize, std::io::Error> {
-             // 1. A real write on the peer end of the pair.
-            peer.write_all(payload)?;
-             // 2. Poll for *real* kernel readiness. `poll` returns Ok(()) on events OR
-             //    a timeout and Err on WouldBlock, so we always re-poll and inspect.
-            let mut events = Events::with_capacity(16);
-            loop {
-                let _ = self.poller.poll(&mut events, Some(timeout));
-                for ev in events.iter() {
-                    if ev.token() == token {
-                        let mut buf = [0u8; 4096];
-                        let n = reader.read(&mut buf)?;
-                        if n > 0 {
-                            return Ok(n);
-                          }
-                        }
-                      }
+        &mut self,
+        token: Token,
+        peer: &mut UnixStream,
+        reader: &mut UnixStream,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<usize, std::io::Error> {
+        // 1. A real write on the peer end of the pair.
+        peer.write_all(payload)?;
+        // 2. Poll for *real* kernel readiness. `poll` returns Ok(()) on events OR
+        //    a timeout and Err on WouldBlock, so we always re-poll and inspect.
+        let mut events = Events::with_capacity(16);
+        loop {
+            let _ = self.poller.poll(&mut events, Some(timeout));
+            for ev in events.iter() {
+                if ev.token() == token {
+                    let mut buf = [0u8; 4096];
+                    let n = reader.read(&mut buf)?;
+                    if n > 0 {
+                        return Ok(n);
                     }
-                 }
+                }
+            }
+        }
+    }
 }
 
 // ============================ integration tests ============================
@@ -100,38 +97,49 @@ impl Reactor {
 mod test {
     use super::*;
 
-             /// A real, non-blocking round trip through `kqueue`/`epoll`: write on one
-             /// end of a Unix-stream pair, poll the other for *live* readiness, and read
-             /// the bytes back. Genuine OS-level non-blocking I/O.
-        #[test]
+    /// A real, non-blocking round trip through `kqueue`/`epoll`: write on one
+    /// end of a Unix-stream pair, poll the other for *live* readiness, and read
+    /// the bytes back. Genuine OS-level non-blocking I/O.
+    #[test]
     fn real_nonblocking_round_trip() {
-            let (a, b) = UnixStream::pair().expect("pair");
-            let mut a = a;
-            let mut reader = b.try_clone().expect("distinct fd for the read");
-            let mut reactor = Reactor::new().expect("reactor");
-            let token = reactor.register_readable(&b);
-             let n = reactor
-                     .round_trip(token, &mut a, &mut reader, b"hello-world",
-                                  Duration::from_secs(5))
-                     .expect("round trip");
-                assert!(n > 0, "the non-blocking read returned no bytes for a non-empty write");
-                assert!(n <= 11, "a read returned more bytes than were written");
-           }
+        let (a, b) = UnixStream::pair().expect("pair");
+        let mut a = a;
+        let mut reader = b.try_clone().expect("distinct fd for the read");
+        let mut reactor = Reactor::new().expect("reactor");
+        let token = reactor.register_readable(&b);
+        let n = reactor
+            .round_trip(
+                token,
+                &mut a,
+                &mut reader,
+                b"hello-world",
+                Duration::from_secs(5),
+            )
+            .expect("round trip");
+        assert!(
+            n > 0,
+            "the non-blocking read returned no bytes for a non-empty write"
+        );
+        assert!(n <= 11, "a read returned more bytes than were written");
+    }
 
-              /// A real write must surface as a kernel readiness event the reactor can
-              /// observe -- proving the poll watches a live source, not a fabricated one.
-        #[test]
+    /// A real write must surface as a kernel readiness event the reactor can
+    /// observe -- proving the poll watches a live source, not a fabricated one.
+    #[test]
     fn readiness_is_observed() {
         let (a, b) = UnixStream::pair().expect("pair");
         let mut a = a;
-            let mut reactor = Reactor::new().expect("reactor");
-            let token = reactor.register_readable(&b);
-            a.write_all(b"readiness!").expect("write");
-             // A short poll should observe readiness on the registered source.
-            let mut events = Events::with_capacity(4);
-            let _ = reactor.poller.poll(&mut events, Some(Duration::from_millis(500)));
-            assert!(
-                events.iter().any(|e| e.token() == token),
-                "a real write must produce a kernel readiness event");
-           }
+        let mut reactor = Reactor::new().expect("reactor");
+        let token = reactor.register_readable(&b);
+        a.write_all(b"readiness!").expect("write");
+        // A short poll should observe readiness on the registered source.
+        let mut events = Events::with_capacity(4);
+        let _ = reactor
+            .poller
+            .poll(&mut events, Some(Duration::from_millis(500)));
+        assert!(
+            events.iter().any(|e| e.token() == token),
+            "a real write must produce a kernel readiness event"
+        );
+    }
 }

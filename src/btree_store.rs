@@ -1,23 +1,22 @@
-//! Disk-backed B-tree page store -- the answer to ROADMAP open question 2 ("log-structured vs
-//! B-tree", "is a B-tree worth it?").
+//! An ordered B+ tree with a CRC-guarded document format -- the Phase 5 answer to
+//! ROADMAP open question 2 ("log-structured vs B-tree").
 //!
-//! A real, disk-backed, fixed-order B-tree: a **balanced** tree built by **splits on insert**,
-//! with each node serialized to a page carrying a [crate::crc::Crc]-protected header so a torn or
-//! corrupted page is rejected on reopen. The on-disk commit is **crash-safe**: write a full tree
-//! snapshot to a temp file, `fsync`, then `rename` over the live file, so a crash never leaves a
-//! half-written tree.
+//! A fixed-order (`ORDER = 5`) B+ tree built by **splits on insert**: separators route to
+//! children and values live only in leaves. The whole tree can be persisted as one
+//! `crc32`-checked document (magic `BTR2`) via [`commit`], crash-safely (tmp + `fsync` +
+//! rename), and reloaded via [`open`]; a torn or corrupted document is rejected.
 //!
 //! # What this *is* and isn't (honest)
-//! A real, balanced B-tree -- splits on insert, get/scan, persistence, crash recovery -- so it
-//! directly answers "is a B-tree worth it": **yes, as a keyed index.** It is the *correct,
-//! compact* B-tree, not a production B*tree: each **commit** rewrites the whole tree (an honest,
-//! fully-correct model of group commit; a production B-tree does *per-page* group commit and in-
-//! place page replacement -- deferred); pages are self-describing variable-length CRC'd records
-//! (not fixed-size on-disk slots -- deferred); and **deletion is not yet supported**: split-on-
-//! insert keeps the tree balanced for the write path, but rebalancing on delete (merge + borrow)
-//! is the documented next extension and is *omitted here* rather than shipped half-correct. The
-//! page layer is the proof of concept for page-oriented I/O that composes with the
-//! [crate::valuestore] blob log; it is not yet the hot path.
+//! * `insert`, `get`, `scan`, `range` and a point `delete` are implemented; deletion does
+//!   **no** merge/borrow rebalancing, so a leaf may underflow (or empty) after deletes.
+//! * The tree is an in-memory nested structure serialised whole: there are no fixed-size
+//!   pages, no page ids and no per-page I/O, and each `commit` rewrites the entire document.
+//! * `scan` and `range` are in-order walks of the *whole* tree, not separator-pruned
+//!   descents, so they cost O(N) rather than O(log N + k); `len`/`is_empty` are O(N) too.
+//! * The live `Store` keeps an instance as a *secondary* range index rebuilt on `open`;
+//!   the persistence path here is not used by the store.
+//!
+//! The rebalancing and range-cost gaps are tracked in `ROADMAP.md`.
 
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -61,8 +60,6 @@ pub(crate) enum Node {
 }
 
 impl Node {
-
-
     fn count(&self) -> usize {
         match self {
             Node::Leaf(l) => l.entries.len(),
@@ -94,19 +91,28 @@ impl Default for BTree {
 impl BTree {
     /// An empty tree.
     pub fn new() -> BTree {
-        BTree { root: Node::Leaf(Leaf { entries: Vec::new() }) }
+        BTree {
+            root: Node::Leaf(Leaf {
+                entries: Vec::new(),
+            }),
+        }
     }
 
     /// Insert (or replace) `key -> val`, splitting any overflowing node on the way back up.
     pub fn insert(&mut self, key: Vec<u8>, val: Vec<u8>) {
         if let Some(split) = insert_rec(&mut self.root, key, val) {
-               // Root overflowed; lift a new single-key root over the two halves.
-            let left = std::mem::replace(&mut self.root, Node::Leaf(Leaf { entries: Vec::new() }));
+            // Root overflowed; lift a new single-key root over the two halves.
+            let left = std::mem::replace(
+                &mut self.root,
+                Node::Leaf(Leaf {
+                    entries: Vec::new(),
+                }),
+            );
             self.root = Node::Internal(Internal {
                 keys: vec![split.median],
                 children: vec![left, split.right],
-             });
-            }
+            });
+        }
     }
 
     /// Fetch the value for `key`, or `None` (linear within a leaf; leaves are at most `ORDER`).
@@ -167,7 +173,6 @@ impl BTree {
     }
 
     #[cfg(test)]
-#[cfg(test)]
     pub fn assert_balanced(&self) {
         assert_invariants(&self.root, true);
     }
@@ -178,7 +183,9 @@ impl BTree {
 fn insert_rec(node: &mut Node, key: Vec<u8>, val: Vec<u8>) -> Option<Split> {
     match node {
         Node::Leaf(leaf) => {
-            let pos = leaf.entries.partition_point(|entry| entry.0.as_slice() < key.as_slice());
+            let pos = leaf
+                .entries
+                .partition_point(|entry| entry.0.as_slice() < key.as_slice());
             if pos < leaf.entries.len() && leaf.entries[pos].0 == key {
                 leaf.entries[pos].1 = val;
             } else {
@@ -190,30 +197,35 @@ fn insert_rec(node: &mut Node, key: Vec<u8>, val: Vec<u8>) -> Option<Split> {
                 let median = entries[mid].0.clone();
                 let right = entries.split_off(mid); // median stays in the right leaf (B+); the key is also copied up
                 leaf.entries = entries;
-                Some(Split { median, right: Node::Leaf(Leaf { entries: right }) })
+                Some(Split {
+                    median,
+                    right: Node::Leaf(Leaf { entries: right }),
+                })
             } else {
                 None
             }
         }
         Node::Internal(inner) => {
-            let i = inner.keys.partition_point(|k| k.as_slice() <= key.as_slice());
+            let i = inner
+                .keys
+                .partition_point(|k| k.as_slice() <= key.as_slice());
             match insert_rec(&mut inner.children[i], key, val) {
                 Some(split) => {
                     inner.keys.insert(i, split.median);
                     inner.children.insert(i + 1, split.right);
                     if inner.children.len() > ORDER {
                         let mid = inner.keys.len() / 2;
-                         let right_children = inner.children.split_off(mid + 1);
-                         let right_keys = inner.keys.split_off(mid + 1);
-                         inner.keys.remove(mid);
-                         let right = Node::Internal(Internal {
-                             keys: right_keys,
-                             children: right_children,
-                         });
-                         // B+ invariant: parent separator = min leaf key of the right subtree, not keys[mid].
-                         let mut sep = Vec::new();
-                         min_leaf_key(&right, &mut sep);
-                         Some(Split { median: sep, right })
+                        let right_children = inner.children.split_off(mid + 1);
+                        let right_keys = inner.keys.split_off(mid + 1);
+                        inner.keys.remove(mid);
+                        let right = Node::Internal(Internal {
+                            keys: right_keys,
+                            children: right_children,
+                        });
+                        // B+ invariant: parent separator = min leaf key of the right subtree, not keys[mid].
+                        let mut sep = Vec::new();
+                        min_leaf_key(&right, &mut sep);
+                        Some(Split { median: sep, right })
                     } else {
                         None
                     }
@@ -226,21 +238,24 @@ fn insert_rec(node: &mut Node, key: Vec<u8>, val: Vec<u8>) -> Option<Split> {
 
 // ---------------- read / scan recursion ----------------
 
-
 /// The smallest leaf key in `node`'s subtree (the B+ routing key for that subtree).
 fn min_leaf_key(node: &Node, out: &mut Vec<u8>) {
     match node {
         Node::Leaf(leaf) => {
             out.clear();
             out.extend_from_slice(&leaf.entries[0].0);
-            }
+        }
         Node::Internal(inner) => min_leaf_key(&inner.children[0], out),
     }
 }
 
 fn get_rec(node: &Node, key: &[u8]) -> Option<Vec<u8>> {
     match node {
-        Node::Leaf(leaf) => leaf.entries.iter().find(|(k, _)| k.as_slice() == key).map(|(_, v)| v.clone()),
+        Node::Leaf(leaf) => leaf
+            .entries
+            .iter()
+            .find(|(k, _)| k.as_slice() == key)
+            .map(|(_, v)| v.clone()),
         Node::Internal(inner) => {
             let i = inner.keys.partition_point(|k| k.as_slice() <= key); // B+ route: first key > key
             get_rec(&inner.children[i], key)
@@ -309,7 +324,6 @@ fn flatten(node: &Node, out: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
 // ---------------- invariant checker (tests) ----------------
 
 #[cfg(test)]
-#[cfg(test)]
 fn assert_invariants(node: &Node, is_root: bool) {
     match node {
         Node::Leaf(l) => {
@@ -318,7 +332,11 @@ fn assert_invariants(node: &Node, is_root: bool) {
             }
             assert!(l.entries.len() < ORDER, "leaf too full");
             if !is_root {
-                assert!(MIN_LEAF_KEYS <= l.entries.len(), "leaf underflow: {}", l.entries.len());
+                assert!(
+                    MIN_LEAF_KEYS <= l.entries.len(),
+                    "leaf underflow: {}",
+                    l.entries.len()
+                );
             }
         }
         Node::Internal(i) => {
@@ -326,7 +344,10 @@ fn assert_invariants(node: &Node, is_root: bool) {
             let n = i.children.len();
             assert!(n <= ORDER, "internal too many children: {n}");
             if !is_root {
-                assert!(MIN_CHILDREN <= n, "internal underflow: {n} < {MIN_CHILDREN}");
+                assert!(
+                    MIN_CHILDREN <= n,
+                    "internal underflow: {n} < {MIN_CHILDREN}"
+                );
             }
             for w in i.keys.windows(2) {
                 assert!(w[0] < w[1], "internal keys not increasing: {w:?}");
@@ -384,7 +405,12 @@ fn write_u64(v: u64, bytes: &mut Vec<u8>) {
 }
 
 fn read_u32(bytes: &[u8], pos: &mut usize) -> u32 {
-    let v = u32::from_le_bytes([bytes[*pos], bytes[*pos + 1], bytes[*pos + 2], bytes[*pos + 3]]);
+    let v = u32::from_le_bytes([
+        bytes[*pos],
+        bytes[*pos + 1],
+        bytes[*pos + 2],
+        bytes[*pos + 3],
+    ]);
     *pos += 4;
     v
 }
@@ -478,7 +504,11 @@ pub fn commit_document(dir: &Path, doc: &[u8]) -> std::io::Result<()> {
     let live = dir.join("btree.dat");
     let tmp = dir.join("btree.tmp");
     {
-        let f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
+        let f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
         let mut w = BufWriter::new(f);
         w.write_all(doc)?;
         w.flush()?;
@@ -504,10 +534,17 @@ pub fn open(dir: &Path) -> std::io::Result<BTree> {
         return Err(std::io::Error::other("btree.dat bad magic"));
     }
     let body = &doc[4..doc.len() - 4];
-    let last4 = [doc[doc.len() - 4], doc[doc.len() - 3], doc[doc.len() - 2], doc[doc.len() - 1]];
+    let last4 = [
+        doc[doc.len() - 4],
+        doc[doc.len() - 3],
+        doc[doc.len() - 2],
+        doc[doc.len() - 1],
+    ];
     let got_crc = u32::from_le_bytes(last4);
     if got_crc != crc32(body) {
-        return Err(std::io::Error::other("btree.dat CRC mismatch (torn/corrupt)"));
+        return Err(std::io::Error::other(
+            "btree.dat CRC mismatch (torn/corrupt)",
+        ));
     }
     match parse_page(body) {
         Some(root) => Ok(BTree { root }),
@@ -516,9 +553,6 @@ pub fn open(dir: &Path) -> std::io::Result<BTree> {
 }
 
 // ---------------- tests ----------------
-
-
-
 
 #[cfg(test)]
 mod test {
@@ -529,179 +563,207 @@ mod test {
     static SEQ: AtomicU64 = AtomicU64::new(1);
 
     /// Mints a unique, stable key token.
-  fn key() -> Vec<u8> {
+    fn key() -> Vec<u8> {
         SEQ.fetch_add(1, Ordering::Relaxed).to_le_bytes().to_vec()
-      }
+    }
 
     fn fresh_dir() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("ks_bt_p5_{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        let p =
+            std::env::temp_dir().join(format!("ks_bt_p5_{}", SEQ.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
-      }
+    }
 
     fn drop_dir(p: &std::path::Path) {
         let _ = std::fs::remove_dir_all(p);
-      }
+    }
 
-      /// In-order dump for hand-diagnosing routing.
-      #[allow(unused)]
-      fn dump(node: &Node, depth: usize) {
-          match node {
-              Node::Leaf(leaf) => {
-                  let fb: Vec<u8> = leaf.entries.iter().map(|(k, _)| k[0]).collect();
-                  eprintln!("{}LEAF n={} fb={:?}", "      ".repeat(depth), leaf.entries.len(), fb);
-                  }
-              Node::Internal(inner) => {
-                  let fb: Vec<u8> = inner.keys.iter().map(|k| k[0]).collect();
-                  eprintln!("{}INT keys#={} fb={:?} children#={}", "      ".repeat(depth), inner.keys.len(), fb, inner.children.len());
-                  for c in inner.children.iter() {
-                      dump(c, depth + 1);
-                      }
-                  }
-                  }
-          }
+    /// In-order dump for hand-diagnosing routing.
+    #[allow(unused)]
+    fn dump(node: &Node, depth: usize) {
+        match node {
+            Node::Leaf(leaf) => {
+                let fb: Vec<u8> = leaf.entries.iter().map(|(k, _)| k[0]).collect();
+                eprintln!(
+                    "{}LEAF n={} fb={:?}",
+                    "      ".repeat(depth),
+                    leaf.entries.len(),
+                    fb
+                );
+            }
+            Node::Internal(inner) => {
+                let fb: Vec<u8> = inner.keys.iter().map(|k| k[0]).collect();
+                eprintln!(
+                    "{}INT keys#={} fb={:?} children#={}",
+                    "      ".repeat(depth),
+                    inner.keys.len(),
+                    fb,
+                    inner.children.len()
+                );
+                for c in inner.children.iter() {
+                    dump(c, depth + 1);
+                }
+            }
+        }
+    }
 
-      #[test]
-     fn leaf_splits_and_scan() {
-          let dir = fresh_dir();
-          let mut t = BTree::new();
-          let keys: Vec<Vec<u8>> = (0..300).map(|_| key()).collect();
-          for (i, k) in keys.iter().enumerate() {
-              t.insert(k.clone(), vec![i as u8, (i / 10) as u8]);
-              t.assert_balanced();
-              }
-          assert_eq!(t.len(), 300, "expected 300 keys");
-          for (i, k) in keys.iter().enumerate() {
-              assert_eq!(t.get(k), Some(vec![i as u8, (i / 10) as u8]), "lookup key {i}");
-              }
-          let all = t.scan(|_| true);
-          assert_eq!(all.len(), 300);
-          for w in all.windows(2) {
-              assert!(w[0].0 < w[1].0, "scan not ascending");
-              }
-          t.assert_balanced();
-          drop_dir(&dir);
-          }
+    #[test]
+    fn leaf_splits_and_scan() {
+        let mut t = BTree::new();
+        let keys: Vec<Vec<u8>> = (0..300).map(|_| key()).collect();
+        for (i, k) in keys.iter().enumerate() {
+            t.insert(k.clone(), vec![i as u8, (i / 10) as u8]);
+            t.assert_balanced();
+        }
+        assert_eq!(t.len(), 300, "expected 300 keys");
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                t.get(k),
+                Some(vec![i as u8, (i / 10) as u8]),
+                "lookup key {i}"
+            );
+        }
+        let all = t.scan(|_| true);
+        assert_eq!(all.len(), 300);
+        for w in all.windows(2) {
+            assert!(w[0].0 < w[1].0, "scan not ascending");
+        }
+        t.assert_balanced();
+    }
 
-      #[test]
-     fn persist_and_recover() {
-          let dir = fresh_dir();
-          let keys: Vec<Vec<u8>> = (0..150).map(|_| key()).collect();
-            {
-              let mut t = BTree::new();
-              for (i, k) in keys.iter().enumerate() {
-                  t.insert(k.clone(), vec![b'v', i as u8]);
-                  }
-              commit(&dir, &t).unwrap();
-              assert!(dir.join("btree.dat").exists());
-              }
-          let t2 = open(&dir).expect("reopen after clean commit");
-          assert_eq!(t2.len(), 150, "recovered tree lost data");
-          for (i, k) in keys.iter().enumerate() {
-              assert_eq!(t2.get(k), Some(vec![b'v', i as u8]), "recovered key {i}");
-              }
-          t2.assert_balanced();
-          drop_dir(&dir);
-          }
+    #[test]
+    fn persist_and_recover() {
+        let dir = fresh_dir();
+        let keys: Vec<Vec<u8>> = (0..150).map(|_| key()).collect();
+        {
+            let mut t = BTree::new();
+            for (i, k) in keys.iter().enumerate() {
+                t.insert(k.clone(), vec![b'v', i as u8]);
+            }
+            commit(&dir, &t).unwrap();
+            assert!(dir.join("btree.dat").exists());
+        }
+        let t2 = open(&dir).expect("reopen after clean commit");
+        assert_eq!(t2.len(), 150, "recovered tree lost data");
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(t2.get(k), Some(vec![b'v', i as u8]), "recovered key {i}");
+        }
+        t2.assert_balanced();
+        drop_dir(&dir);
+    }
 
-      #[test]
-     fn corrupt_document_rejected() {
-          let dir = fresh_dir();
-          let mut t = BTree::new();
-          for _ in 0..50 {
-              t.insert(key(), vec![b'x']);
-              }
-          let doc = tree_document(&t.root);
-          commit_document(&dir, &doc).unwrap();
-          let mut raw = std::fs::read(dir.join("btree.dat")).unwrap();
-          raw[doc.len() / 2] ^= 0x80;
-          std::fs::write(dir.join("btree.dat"), &raw).unwrap();
-          assert!(open(&dir).is_err(), "corrupt document must be rejected on open");
-          drop_dir(&dir);
-          }
+    #[test]
+    fn corrupt_document_rejected() {
+        let dir = fresh_dir();
+        let mut t = BTree::new();
+        for _ in 0..50 {
+            t.insert(key(), vec![b'x']);
+        }
+        let doc = tree_document(&t.root);
+        commit_document(&dir, &doc).unwrap();
+        let mut raw = std::fs::read(dir.join("btree.dat")).unwrap();
+        raw[doc.len() / 2] ^= 0x80;
+        std::fs::write(dir.join("btree.dat"), &raw).unwrap();
+        assert!(
+            open(&dir).is_err(),
+            "corrupt document must be rejected on open"
+        );
+        drop_dir(&dir);
+    }
 
-      #[test]
-     fn empty_round_trips() {
-          let dir = fresh_dir();
-          let t = BTree::new();
-          commit(&dir, &t).unwrap();
-          let t2 = open(&dir).unwrap();
-          assert!(t2.is_empty());
-          drop_dir(&dir);
-          }
+    #[test]
+    fn empty_round_trips() {
+        let dir = fresh_dir();
+        let t = BTree::new();
+        commit(&dir, &t).unwrap();
+        let t2 = open(&dir).unwrap();
+        assert!(t2.is_empty());
+        drop_dir(&dir);
+    }
 
-      #[test]
-     fn in_order_matches_btreemap() {
-          let dir = fresh_dir();
-          let mut t = BTree::new();
-          let mut expected = BTreeMapT::new();
-          for i in 0..500 {
-              let k = key();
-              let v = vec![i as u8, (i / 100) as u8];
-              t.insert(k.clone(), v.clone());
-              expected.insert(k, v);
-              t.assert_balanced();
-              }
-          assert_eq!(t.to_sorted_map(), expected);
-          drop_dir(&dir);
-          }
+    #[test]
+    fn in_order_matches_btreemap() {
+        let mut t = BTree::new();
+        let mut expected = BTreeMapT::new();
+        for i in 0..500 {
+            let k = key();
+            let v = vec![i as u8, (i / 100) as u8];
+            t.insert(k.clone(), v.clone());
+            expected.insert(k, v);
+            t.assert_balanced();
+        }
+        assert_eq!(t.to_sorted_map(), expected);
+    }
 
-      #[test]
-     fn one_key_get() {
-          let mut t = BTree::new();
-          t.insert(b"abc".to_vec(), b"1".to_vec());
-          t.insert(b"def".to_vec(), b"2".to_vec());
-          assert_eq!(t.get(b"abc"), Some(b"1".to_vec()));
-          assert_eq!(t.get(b"def"), Some(b"2".to_vec()));
-          assert_eq!(t.get(b"xyz"), None);
-          }
-        #[test]
+    #[test]
+    fn one_key_get() {
+        let mut t = BTree::new();
+        t.insert(b"abc".to_vec(), b"1".to_vec());
+        t.insert(b"def".to_vec(), b"2".to_vec());
+        assert_eq!(t.get(b"abc"), Some(b"1".to_vec()));
+        assert_eq!(t.get(b"def"), Some(b"2".to_vec()));
+        assert_eq!(t.get(b"xyz"), None);
+    }
+    #[test]
     fn deleted_key_vanishes_and_lookups_stay_valid() {
-         // Stable, ordered, big-endian numeric keys with a 0x55 prefix so they
-         // don't collide with the minted `key()` sequence tokens used by other tests.
+        // Stable, ordered, big-endian numeric keys with a 0x55 prefix so they
+        // don't collide with the minted `key()` sequence tokens used by other tests.
         let k = |i: u64| -> Vec<u8> {
             let mut k = vec![0x55u8];
             k.extend_from_slice(&i.to_be_bytes());
             k
-          };
+        };
         let mut b = BTree::new();
         for i in 0..200u64 {
             b.insert(k(i), u32::try_from(i).unwrap().to_le_bytes().to_vec());
-           }
-          // Delete every 7th key; each must then vanish from get.
-        let mut gone = 0usize;        for i in 0..200u64 {
+        }
+        // Delete every 7th key; each must then vanish from get.
+        let mut gone = 0usize;
+        for i in 0..200u64 {
             if i % 7 == 0 {
                 assert!(b.delete(k(i).as_slice()), "delete not-found for a live key");
                 assert_eq!(b.get(k(i).as_slice()), None, "a deleted key is still found");
-                gone += 1;              }
+                gone += 1;
             }
-          // Deleting a never-present key is a no-op.
-        assert!(!b.delete(k(99999).as_slice()), "deleting an absent key is a no-op");
+        }
+        // Deleting a never-present key is a no-op.
+        assert!(
+            !b.delete(k(99999).as_slice()),
+            "deleting an absent key is a no-op"
+        );
         assert_eq!(b.len(), 200 - gone, "len must shrink by the number deleted");
         assert_eq!(b.get(k(1).as_slice()), Some(1u32.to_le_bytes().to_vec()));
-        }
+    }
 
-        #[test]
+    #[test]
     fn range_query_is_ordered_and_bounded() {
-         // Deterministic, big-endian ordered keys so [lo,hi) is meaningful.
+        // Deterministic, big-endian ordered keys so [lo,hi) is meaningful.
         let k = |i: u64| -> Vec<u8> {
             let mut k = vec![0x55u8];
             k.extend_from_slice(&i.to_be_bytes());
             k
-          };
+        };
         let mut b = BTree::new();
         for i in 0..200u64 {
             b.insert(k(i), u32::try_from(i).unwrap().to_le_bytes().to_vec());
-           }
-          // Delete an interior key: it must drop out of the range.
+        }
+        // Delete an interior key: it must drop out of the range.
         b.delete(k(52).as_slice());
         let got = b.range(k(50).as_slice(), k(57).as_slice()); // [50,57)
-        let got_idx: Vec<u64> = got.iter()
-             .map(|(k, _)| u64::from_be_bytes(k[1..].try_into().unwrap()))
-             .collect();
-          // 52 is gone, 57 is excluded: [50,51,53,54,55,56].
-        assert_eq!(got_idx, vec![50, 51, 53, 54, 55, 56], "range excludes the deleted key and the hi bound");
-        assert!(got_idx.windows(2).all(|w| w[0] < w[1]), "range output must be ascending");
-        }
+        let got_idx: Vec<u64> = got
+            .iter()
+            .map(|(k, _)| u64::from_be_bytes(k[1..].try_into().unwrap()))
+            .collect();
+        // 52 is gone, 57 is excluded: [50,51,53,54,55,56].
+        assert_eq!(
+            got_idx,
+            vec![50, 51, 53, 54, 55, 56],
+            "range excludes the deleted key and the hi bound"
+        );
+        assert!(
+            got_idx.windows(2).all(|w| w[0] < w[1]),
+            "range output must be ascending"
+        );
+    }
 }

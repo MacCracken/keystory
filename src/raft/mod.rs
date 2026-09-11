@@ -1,20 +1,19 @@
-//! # Phase 2 -- leader-based replicated KV (Raft-inspired)
+//! # Leader-based replicated KV (Raft-inspired): Phases 2 and 4
 //!
-//! A small, dependency-free replication layer built on the Phase-1 durable engine.
-//! Its design and **limitations are stated in `ROADMAP.md`; read that before using this
-//! for anything real.**
+//! A dependency-free replication layer: a pure Raft FSM ([`node`]), an in-process,
+//! synchronous cluster driver ([`cluster`]), and an `async fn` facade over that driver
+//! ([`async_driver`]) running on the cooperative runtime in [`crate::rt`].
 //!
-//! This module starts with the pure FSM core; the in-process cluster driver is added as
-//! it lands.
-//!
-//! *Safety:* quorum commit, leader-authoritative application, and the log-matching
-//! property are the parts that make replication *correct*; the in-process, synchronous
-//! transport is the part that is *not yet* production-grade.
+//! **Honest scope.** The protocol logic (quorum election, log matching, majority commit)
+//! is real; the transport is not: peers are called on one thread's stack, there are no
+//! sockets, no election timers, and no persistence. Nodes keep in-memory logs and state
+//! and do **not** use the durable [`crate::Store`] yet. `ROADMAP.md` records what is
+//! proven and what is not; read it before using this for anything real.
 
-pub mod node;
-pub mod cluster;
 pub mod async_driver;
+pub mod cluster;
+pub mod node;
 
-pub use node::{Cmd, Log, LogEntry, Map, Node, NodeId, Role};
-pub use cluster::{RaftCluster, ClusterError};
 pub use async_driver::{get, put, run, scan};
+pub use cluster::{ClusterError, RaftCluster};
+pub use node::{Cmd, Log, LogEntry, Map, Node, NodeId, Role};

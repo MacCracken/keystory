@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The toolchain comes from rust-toolchain.toml (pinned, with rustfmt + clippy), which
+# rustup on the GitHub runners installs automatically on the first cargo invocation.
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo clippy --all-targets -- -D warnings
+
+  doc:
+    name: rustdoc (-D warnings)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo doc --no-deps
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The crash tests SIGKILL a child via `kill -9`, so the suite is Unix-only.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --all-targets
+      - run: cargo build --release
+
+  msrv:
+    name: MSRV (1.81)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.81 --profile minimal --no-self-update
+      - run: cargo +1.81 check --all-targets

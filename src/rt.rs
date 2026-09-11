@@ -1,17 +1,17 @@
 //! A minimal, **cooperative, single-threaded async runtime** -- no runtime crate.
 //!
 //! This is the std-only Phase-4 answer to "an async runtime": a `block_on` driver and a
-//! `spawn` + cooperative scheduler built on the language's own [`Future`]/[`Poll`]/[`Waker`]
-//! machinery, with **zero external dependencies**. It models the asynchronous *programming
-//! model* honestly: a task yields at each `.await` and its waker re-queues it; `block_on`
-//! pumps the ready-queue to completion.
+//! cooperative scheduler (tasks are queued with [`Scheduler::add`]) built on the
+//! language's own [`Future`]/[`Poll`]/[`Waker`] machinery. It models the asynchronous
+//! *programming model* honestly: a task yields at each `.await` and its waker re-queues
+//! it; `block_on` pumps the ready-queue to completion.
 //!
 //! # What it is NOT (and why)
-//! There is *no asynchronous I/O source*. A non-blocking reactor (epoll / kqueue / io_uring)
-//! needs platform calls the std-only, no-deps constraint forbids (`libc`/`mio`). So this
-//! runtime drives futures that resolve *cooperatively* on the thread -- every yield point
-//! completes once polled. That is the honest core of "async end-to-end" with no OS I/O source;
-//! wiring a real non-blocking source is the next, libc-gated step.
+//! There is *no asynchronous I/O source driving this scheduler*. The `mio` reactor in
+//! `crate::asyncio` (Phase 5) proves real kernel readiness on a Unix-stream pair, but it
+//! is not yet connected to this ready-queue, so the futures here resolve
+//! *cooperatively* on the thread -- every yield point completes once polled. Wiring the
+//! reactor into the scheduler is tracked in `ROADMAP.md`.
 //!
 //! Wakers are built by hand via the [`RawWakerVTable`] pattern (the canonical "build-your-own
 //! runtime" technique): a waker carries its task's id plus an [`Arc`]-shared handle to the
@@ -24,14 +24,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 /// A shared, single-threaded scheduler: a vector of tasks plus the queue of ids to run.
-#[allow(clippy::type_complexity, reason = "core async types (a Pin<Box<dyn Future>> task vector) are complex")]
+#[allow(
+    clippy::type_complexity,
+    reason = "core async types (a Pin<Box<dyn Future>> task vector) are complex"
+)]
 pub struct Scheduler {
     /// All live tasks; `None` once finished.
     tasks: Mutex<Vec<Option<Pin<Box<dyn Future<Output = ()>>>>>>,
     /// Ready queue of task ids; `Arc`-shared with the wakers so `wake` can re-enqueue.
     queue: Arc<Mutex<VecDeque<usize>>>,
 }
-#[allow(clippy::arc_with_non_send_sync, reason = "single-threaded: Arc<Scheduler> need not cross threads")]
+#[allow(
+    clippy::arc_with_non_send_sync,
+    reason = "single-threaded: Arc<Scheduler> need not cross threads"
+)]
 impl Scheduler {
     /// An empty scheduler.
     pub fn new() -> Arc<Scheduler> {
@@ -55,7 +61,10 @@ impl Scheduler {
 
     /// Pump the queue until it drains. A task reschedules itself via its waker, so an empty
     /// queue means nothing is waiting -- we are done.
-#[allow(clippy::single_match, reason = "the None arm keeps the per-iteration shape explicit")]
+    #[allow(
+        clippy::single_match,
+        reason = "the None arm keeps the per-iteration shape explicit"
+    )]
     pub fn run(&self) {
         loop {
             let id = match self.queue.lock().unwrap().pop_front() {
@@ -88,7 +97,10 @@ impl Scheduler {
     }
 
     /// Drive a root future to completion on this scheduler, returning its output.
-#[allow(clippy::arc_with_non_send_sync, reason = "F::Output need not be Send/Sync in a single-threaded runtime")]
+    #[allow(
+        clippy::arc_with_non_send_sync,
+        reason = "F::Output need not be Send/Sync in a single-threaded runtime"
+    )]
     pub fn block_on<F>(&self, fut: F) -> F::Output
     where
         F: Future + 'static,
@@ -97,11 +109,10 @@ impl Scheduler {
         let sink = out.clone();
 
         // Box the root; on completion, stow the output.
-        let boxed: Pin<Box<dyn Future<Output = ()>>> =
-            Box::pin(async move {
-                let v = fut.await;
-                *sink.lock().unwrap() = Some(v);
-            });
+        let boxed: Pin<Box<dyn Future<Output = ()>>> = Box::pin(async move {
+            let v = fut.await;
+            *sink.lock().unwrap() = Some(v);
+        });
 
         // Add the root and drain the queue, including anything it cooperated with.
         let _ = self.add(boxed);
@@ -119,10 +130,7 @@ impl Scheduler {
 fn waker_for_task(id: usize, queue: Arc<Mutex<VecDeque<usize>>>) -> Waker {
     // SAFETY: the raw pointer aliases the boxed `WakerRaw`, whose lifetime the vtable
     // manages (`drop` owns it; `clone` clones it).
-    let data = Box::into_raw(Box::new(WakerRaw {
-            id,
-            queue,
-        })) as *const ();
+    let data = Box::into_raw(Box::new(WakerRaw { id, queue })) as *const ();
     // A `'static` reference so the waker outlives this local.
     let vt = shared_vtable();
     // SAFETY: `data` aliases the live `WakerRaw`; the vtable governs its lifetime onward.
@@ -211,7 +219,7 @@ pub fn yield_once() -> YieldOnce {
 
 #[cfg(test)]
 mod test {
-    use super::{Scheduler, yield_once};
+    use super::{yield_once, Scheduler};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 

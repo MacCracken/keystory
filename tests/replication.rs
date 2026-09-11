@@ -15,8 +15,8 @@
 //! sub-clusters each running its own election). See `ROADMAP.md` for what this proves and
 //! what it does not -- the phase that adds real async networking.
 
-use keystore::checker::{CheckModel, Model};
-use keystore::raft::{ClusterError, RaftCluster};
+use keystory::checker::{CheckModel, Model};
+use keystory::raft::{ClusterError, RaftCluster};
 use std::sync::Arc;
 
 const KEYS: u64 = 40;
@@ -46,7 +46,11 @@ fn three_nodes_converge_on_writes_and_reads() {
     // Every node must agree; `get` already asserts convergence, but verify explicitly.
     for n in 0..KEYS {
         let v = c.get(key(n)).expect("read on a live cluster");
-        assert_eq!(v, Some(value(n, WRITES - 1)), "every node converged on the last write");
+        assert_eq!(
+            v,
+            Some(value(n, WRITES - 1)),
+            "every node converged on the last write"
+        );
     }
     assert!(c.leader().is_some(), "a healthy cluster has a leader");
 }
@@ -64,7 +68,8 @@ fn failover_preserves_committed_state() {
 
     for i in 0..WRITES {
         for n in 0..KEYS {
-            c.put(key(n), value(n, i)).expect("a healthy majority commits on a live quorum");
+            c.put(key(n), value(n, i))
+                .expect("a healthy majority commits on a live quorum");
         }
         // Kill the leader exactly once, mid-workload; the next op re-elects and continues.
         if i == WRITES / 2 {
@@ -75,7 +80,11 @@ fn failover_preserves_committed_state() {
 
     for n in 0..KEYS {
         let v = c.get(key(n)).expect("read after failover");
-        assert_eq!(v, Some(value(n, WRITES - 1)), "no committed update lost across failover");
+        assert_eq!(
+            v,
+            Some(value(n, WRITES - 1)),
+            "no committed update lost across failover"
+        );
     }
 
     let r = model.check();
@@ -121,9 +130,20 @@ fn minority_partition_cannot_commit() {
 
     c.revive(followers[0]);
     c.revive(followers[1]);
-    assert!(c.put(key(99), value(99, 7)).is_ok(), "after healing, a majority commits");
-    assert_eq!(c.get(key(99)).unwrap(), Some(value(99, 7)), "healed cluster converged");
-    assert_eq!(c.get(key(0)).unwrap(), Some(value(0, 9)), "prior committed state preserved");
+    assert!(
+        c.put(key(99), value(99, 7)).is_ok(),
+        "after healing, a majority commits"
+    );
+    assert_eq!(
+        c.get(key(99)).unwrap(),
+        Some(value(99, 7)),
+        "healed cluster converged"
+    );
+    assert_eq!(
+        c.get(key(0)).unwrap(),
+        Some(value(0, 9)),
+        "prior committed state preserved"
+    );
 }
 
 /// Many concurrent client threads hitting a live 3-node cluster. Each commit is recorded in
@@ -145,7 +165,8 @@ fn concurrent_writers_and_readers_stay_linearizable() {
                 for i in 0..OPS {
                     let n = (c as u64 + i as u64) % KEYS;
                     if i % 3 == 0 {
-                        cl.put(key(n), value(n, i as u64)).expect("healthy commit under load");
+                        cl.put(key(n), value(n, i as u64))
+                            .expect("healthy commit under load");
                     } else {
                         let _ = cl.get(key(n));
                     }

@@ -99,7 +99,7 @@ impl Log {
     pub fn get(&self, index: u64) -> Option<&LogEntry> {
         if index == 0 {
             return None;
-          }
+        }
         self.entries.get((index - 1) as usize)
     }
 
@@ -139,7 +139,7 @@ pub struct Node {
     pub term: u64,
     /// `votedFor`.
     pub voted_for: Option<NodeId>,
-      /// The leader this node is currently tracking (`None` when none / after a vote).
+    /// The leader this node is currently tracking (`None` when none / after a vote).
     pub leader_id: Option<NodeId>,
     /// Current role.
     pub role: Role,
@@ -229,10 +229,9 @@ impl Node {
             return false;
         }
         // Eligibility: the candidate's log is at least as up-to-date as ours.
-        let up_to_date =
-            sender_last_term > self.log.last_term()
-                || (sender_last_term == self.log.last_term()
-                    && sender_last_index >= self.log.last_index());
+        let up_to_date = sender_last_term > self.log.last_term()
+            || (sender_last_term == self.log.last_term()
+                && sender_last_index >= self.log.last_index());
         if !up_to_date {
             return false;
         }
@@ -312,11 +311,7 @@ impl Node {
             if self.log.term_of(i) != Some(self.term) {
                 continue;
             }
-            let reps = self
-                .match_idx
-                .values()
-                .filter(|&&m| m >= i)
-                .count();
+            let reps = self.match_idx.values().filter(|&&m| m >= i).count();
             if reps >= q {
                 self.commit_idx = i;
             }
@@ -347,7 +342,10 @@ impl Node {
     /// A leader appends a new client command to its own log. Returns the new index. The
     /// caller replicates it (`append_entries` on peers) and commits (`advance_commit`).
     pub fn propose(&mut self, cmd: Cmd) -> u64 {
-        assert!(matches!(self.role, Role::Leader), "only a leader may propose");
+        assert!(
+            matches!(self.role, Role::Leader),
+            "only a leader may propose"
+        );
         let e = LogEntry::new(self.term, cmd);
         let idx = self.log.append(std::slice::from_ref(&e))[0];
         self.match_idx.insert(self.id, idx); // the leader is a replica of its own log.
@@ -410,7 +408,10 @@ mod tests {
         assert!(ns[1].request_vote(2, 1, 0, 0), "peer 1 grants");
         assert_eq!(ns[0].term, 1, "peers adopt the candidate's term");
         // A second candidate in the same term gets denied: one vote per node per term.
-        assert!(!ns[1].request_vote(0, 1, 0, 0), "node 1 keeps its vote for 2");
+        assert!(
+            !ns[1].request_vote(0, 1, 0, 0),
+            "node 1 keeps its vote for 2"
+        );
         // Three grants incl. self = quorum of 3.
         assert!(ns[2].voted_for == Some(2));
     }
@@ -436,7 +437,9 @@ mod tests {
     fn log_mismatch_is_corrected() {
         let mut follower = Node::new(1, BTreeSet::from([0u64, 1]));
         // Follower's own entry 1 was written under term 1.
-        follower.log.append(&[LogEntry::new(1, Op::Delete { key: b"y".to_vec() })]);
+        follower
+            .log
+            .append(&[LogEntry::new(1, Op::Delete { key: b"y".to_vec() })]);
         // A term-2 leader tries to continue after a prev whose term it claims is 9:
         // that cannot match the follower's entry at index 1 (term 1).
         let reply = follower.append_entries(0, 2, 1, 9, &[], 0);
@@ -446,9 +449,16 @@ mod tests {
             "mismatch => leader should resume from index 0"
         );
         assert_eq!(
-            follower.log.last_index(), 0, "the divergent entry was truncated");
-        
-        assert_eq!(follower.role, Role::Follower, "it now follows the newer leader");
+            follower.log.last_index(),
+            0,
+            "the divergent entry was truncated"
+        );
+
+        assert_eq!(
+            follower.role,
+            Role::Follower,
+            "it now follows the newer leader"
+        );
     }
 
     #[test]
@@ -469,11 +479,9 @@ mod tests {
             // mutable borrow of `ns[p]` below never aliases `ns[0]`.
             let id = ns[0].id;
             let term = ns[0].term;
-            let entries =
-                ns[0].log.get(idx).cloned().into_iter().collect::<Vec<_>>();
+            let entries = ns[0].log.get(idx).cloned().into_iter().collect::<Vec<_>>();
             let prev_term = ns[0].log.term_of(idx - 1).unwrap_or(0);
-            let res = ns[p as usize]
-                 .append_entries(id, term, idx - 1, prev_term, &entries, 0);
+            let res = ns[p as usize].append_entries(id, term, idx - 1, prev_term, &entries, 0);
             assert!(res.is_none(), "the peer accepted the contiguous append");
             ns[0].match_idx.insert(p, idx);
         }
@@ -481,14 +489,14 @@ mod tests {
         ns[0].advance_commit();
         assert_eq!(ns[0].commit_idx, 1, "committed once 2 of 3 hold it");
         // Propagate the *commit index* to the followers via a no-new-entry append:
-      // their logs already hold the entry, so each just advances commit_idx and will apply.
-    for p in [1u64, 2] {
-        let li = ns[0].id;
-        let lterm = ns[0].term;
-        let lci = ns[0].commit_idx;
-        let res = ns[p as usize].append_entries(li, lterm, idx, lterm, &[], lci);
-        assert!(res.is_none(), "the peer advanced its commit index");
-      }
+        // their logs already hold the entry, so each just advances commit_idx and will apply.
+        for p in [1u64, 2] {
+            let li = ns[0].id;
+            let lterm = ns[0].term;
+            let lci = ns[0].commit_idx;
+            let res = ns[p as usize].append_entries(li, lterm, idx, lterm, &[], lci);
+            assert!(res.is_none(), "the peer advanced its commit index");
+        }
         for n in &mut ns {
             n.apply_committed();
         }
@@ -518,10 +526,7 @@ mod tests {
         });
         ns[1].match_idx.insert(2, i2); // stand-in: peer 2 replicated both entries.
         ns[1].advance_commit();
-        assert_eq!(
-            ns[1].commit_idx,
-            i2,
-        "both entries committed to a majority");
+        assert_eq!(ns[1].commit_idx, i2, "both entries committed to a majority");
         ns[1].apply_committed();
 
         // A fresh node adopts node 1's log + commit and applies.
