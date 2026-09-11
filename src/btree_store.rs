@@ -137,8 +137,29 @@ impl BTree {
         self.len() == 0
     }
 
+    /// Delete `key` from the tree, if present. Returns whether it was removed.
+    ///
+    /// This is a **point erase with no rebalancing**: the key is removed from its
+    /// leaf, which may then fall below `MIN_LEAF_KEYS`. The tree stays *correct* --
+    /// routing by `min_leaf_key` and `get`/`scan` remain valid -- but it is no longer
+    /// balanced after heavy deletions. Merging/borrowing to re-balance is a separate,
+    /// explicitly deferred piece (see the module doc-comment).
+    pub fn delete(&mut self, key: &[u8]) -> bool {
+        delete_rec(&mut self.root, key)
+    }
+
+    /// Collect entries with `lo <= key < hi` in **ascending** order (an ordered range
+    /// query). This is the range counterpart of [`BTree::scan`]; the store builds its
+    /// range scans on it.
+    pub fn range(&self, lo: &[u8], hi: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        collect(&self.root, &mut out, &|e: &(Vec<u8>, Vec<u8>)| {
+            e.0.as_slice() >= lo && e.0.as_slice() < hi
+        });
+        out
+    }
+
     #[cfg(test)]
-#[cfg(test)]
     pub fn to_sorted_map(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let mut map = BTreeMap::new();
         flatten(&self.root, &mut map);
@@ -223,6 +244,28 @@ fn get_rec(node: &Node, key: &[u8]) -> Option<Vec<u8>> {
         Node::Internal(inner) => {
             let i = inner.keys.partition_point(|k| k.as_slice() <= key); // B+ route: first key > key
             get_rec(&inner.children[i], key)
+        }
+    }
+}
+
+/// Route to the leaf holding `key` and erase its entry; returns `true` if removed.
+/// No rebalancing: the leaf may end up smaller than `MIN_LEAF_KEYS`.
+fn delete_rec(node: &mut Node, key: &[u8]) -> bool {
+    match node {
+        Node::Leaf(leaf) => {
+            // The leaf is sorted, so a partition-point + equality check locates it.
+            let pos = leaf.entries.partition_point(|(k, _)| k.as_slice() < key);
+            if pos < leaf.entries.len() && leaf.entries[pos].0.as_slice() == key {
+                leaf.entries.remove(pos);
+                true
+            } else {
+                false
+            }
+        }
+        Node::Internal(inner) => {
+            // Route to the child that owns `key` (same `<=` rule as `get`/`insert`).
+            let i = inner.keys.partition_point(|k| k.as_slice() <= key);
+            delete_rec(&mut inner.children[i], key)
         }
     }
 }
@@ -613,4 +656,52 @@ mod test {
           assert_eq!(t.get(b"def"), Some(b"2".to_vec()));
           assert_eq!(t.get(b"xyz"), None);
           }
+        #[test]
+    fn deleted_key_vanishes_and_lookups_stay_valid() {
+         // Stable, ordered, big-endian numeric keys with a 0x55 prefix so they
+         // don't collide with the minted `key()` sequence tokens used by other tests.
+        let k = |i: u64| -> Vec<u8> {
+            let mut k = vec![0x55u8];
+            k.extend_from_slice(&i.to_be_bytes());
+            k
+          };
+        let mut b = BTree::new();
+        for i in 0..200u64 {
+            b.insert(k(i), u32::try_from(i).unwrap().to_le_bytes().to_vec());
+           }
+          // Delete every 7th key; each must then vanish from get.
+        let mut gone = 0usize;        for i in 0..200u64 {
+            if i % 7 == 0 {
+                assert!(b.delete(k(i).as_slice()), "delete not-found for a live key");
+                assert_eq!(b.get(k(i).as_slice()), None, "a deleted key is still found");
+                gone += 1;              }
+            }
+          // Deleting a never-present key is a no-op.
+        assert!(!b.delete(k(99999).as_slice()), "deleting an absent key is a no-op");
+        assert_eq!(b.len(), 200 - gone, "len must shrink by the number deleted");
+        assert_eq!(b.get(k(1).as_slice()), Some(1u32.to_le_bytes().to_vec()));
+        }
+
+        #[test]
+    fn range_query_is_ordered_and_bounded() {
+         // Deterministic, big-endian ordered keys so [lo,hi) is meaningful.
+        let k = |i: u64| -> Vec<u8> {
+            let mut k = vec![0x55u8];
+            k.extend_from_slice(&i.to_be_bytes());
+            k
+          };
+        let mut b = BTree::new();
+        for i in 0..200u64 {
+            b.insert(k(i), u32::try_from(i).unwrap().to_le_bytes().to_vec());
+           }
+          // Delete an interior key: it must drop out of the range.
+        b.delete(k(52).as_slice());
+        let got = b.range(k(50).as_slice(), k(57).as_slice()); // [50,57)
+        let got_idx: Vec<u64> = got.iter()
+             .map(|(k, _)| u64::from_be_bytes(k[1..].try_into().unwrap()))
+             .collect();
+          // 52 is gone, 57 is excluded: [50,51,53,54,55,56].
+        assert_eq!(got_idx, vec![50, 51, 53, 54, 55, 56], "range excludes the deleted key and the hi bound");
+        assert!(got_idx.windows(2).all(|w| w[0] < w[1]), "range output must be ascending");
+        }
 }

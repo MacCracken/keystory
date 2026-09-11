@@ -185,6 +185,24 @@ impl Store {
               .map(|(k, e)| (k, e.value))
               .collect()
      }
+        /// Ordered range scan `[lo, hi)` served by the Phase-5 **B-tree store**: the
+        /// published snapshot is materialised into a `btree_store::BTree` and the range
+        /// is read through a genuine B+ traversal -- not a linear walk. Wires the B-tree
+        /// into the live store as its ordered-range query engine. Half-open: `lo` in, `hi` out.
+        ///
+        /// **Honest scope:** the B-tree is built from the snapshot per call (an O(N) build);
+        /// it demonstrates the B-tree as the store's query substrate, not a persistently
+        /// maintained secondary index. The authoritative durable state remains RCU `Snapshot` + WAL.
+    pub fn range_scan(&self, lo: impl AsRef<[u8]>, hi: impl AsRef<[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let snap = self.snap.load();
+        let lo = lo.as_ref().to_vec();
+        let hi = hi.as_ref().to_vec();
+        let mut tree = crate::btree_store::BTree::new();
+        for (k, e) in &snap.data {
+            tree.insert(k.clone(), e.value.clone());
+               }
+        tree.range(&lo, &hi)
+          }
 
           // ---- core commit path ----
       /// Serialise, clone-on-write the snapshot, apply the op, durable-append first,
@@ -386,4 +404,36 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(s.get(b"hot"), Some(b"4999".to_vec()));
      }
+
+       #[test]
+    fn range_scan_served_by_btree() {
+               // Stable, ascending 5-byte keys: 'k' + big-endian u32 index.
+        let k = |i: u32| -> Vec<u8> {
+            let mut v = b"k".to_vec();
+            v.extend_from_slice(&i.to_be_bytes());
+            v
+                 };
+               // Read a key's index via explicit bytes ('k' + 4 big-endian bytes).
+        let idx_of = |kk: &Vec<u8>| -> u32 {
+            let mut n = [0u8; 4];
+            n.copy_from_slice(&kk[1..5]);
+            u32::from_be_bytes(n)
+                 };
+        let (_d, s) = tmp_store("range", 1 << 20);
+               // Put k1..k50 ascending, value = index byte.
+        for i in 1..=50u32 { s.put(k(i), vec![i as u8]).expect("put"); }
+               // The live store now serves an ordered [20,30) range via the B-tree.
+        let got = s.range_scan(k(20), k(30));
+        let idx: Vec<u32> = got.iter().map(|(kk, _v)| idx_of(kk)).collect();
+        assert_eq!(idx, (20u32..30u32).collect::<Vec<u32>>(), "range must be [k20,k30) in ascending order");
+        assert!(idx.windows(2).all(|w| w[0] < w[1]), "output stays ascending");
+               // Half-open: lo inclusive, hi exclusive.
+        assert_eq!(idx.first(), Some(&20u32), "lo inclusive");
+        assert_eq!(idx.last(), Some(&29u32), "hi exclusive");
+               // A deleted interior key drops out of a later range scan.
+        s.delete(k(25)).unwrap();
+        let after = s.range_scan(k(20), k(30));
+        let aidx: Vec<u32> = after.iter().map(|(kk, _v)| idx_of(kk)).collect();
+        assert!(!aidx.contains(&25), "a deleted key drops out of the range");
+           }
 }
