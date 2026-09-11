@@ -6,6 +6,7 @@
 #![allow(clippy::doc_lazy_continuation)] // long module-doc prose uses continuation lines
 #![warn(clippy::all)]
 pub mod rcu;
+pub mod epoch_rcu;
 pub mod types;
 pub mod wal;
 pub mod snapshot;
