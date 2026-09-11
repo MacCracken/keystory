@@ -16,6 +16,8 @@ pub mod engine;
 pub mod raft;
 pub mod checker;
 
+pub mod rt;
+
 /// Re-export the public entry point at the crate root.
 pub use engine::Store;
 /// Re-export the core value/op types for ergonomic `use keystore::...`.

@@ -291,15 +291,77 @@ and decoded identically to the buffered writer).
 
 ---
 
-## Phase 4 — Async end-to-end + async I/O -- planned
+## Phase 4 — Async end-to-end + async I/O — **DONE** (runtime + model; real I/O source deferred)
 
-The async runtime and an async-safe API; revisit RCU reclamation + I/O concurrency; decide the
-node transport (TCP vs unix socket -- possibly moot once async arrives). This is where
-*asynchronous I/O* is finally in scope (question 1 stays open until here).
+A std-only, **no-deps cooperative async runtime** and an **async API** that reaches the Phase-2
+cluster exactly, honestly scoped to the constraint: the *programming model* is real and tested end-
+to-end; the actual I/O *source* is modeled (not a real non-blocking reactor), because that would
+need `libc`, which the no-deps invariant forbids.
 
-> Decision raised at Phase-3 gate and **answered for the storage layout**: stay **log-structured**
-> (do not hand-roll a B-tree this phase -- deferred to Phase 5); add an append-only blob log for
-> large values with compaction; add streaming (constant-memory) checkpoints.
+### Design decisions (chosen here, with rationale)
+1. **Stay log-structured -- answer open #2 "yes, log-structured; no B-tree" for this phase** and
+   defer a B-tree index to Phase 5. (Same decision as Phase 3; recorded again at the Phase-4 gate
+   so it is explicit the question is *answered*, not deferred to Phase 4.)
+2. **A hand-rolled cooperative async runtime, no crate.** `scheduler + block_on + spawn` built on
+   the language's own `Future`/`Poll`/`Waker`, with **raw wakers built by hand** via
+   `RawWakerVTable` (the canonical "build your own runtime" technique). `Arc`-shared ready queue.
+3. **The async I/O *source* is modeled, not real.** There is no epoll/kqueue/io_uring. Instead a
+   `YieldOnce` future yields once (Pending, then Ready) so the scheduler *genuinely* drives an
+   async boundary; an async API over the cluster awaits it between replicated steps. Honest:
+   proven the model works; wiring a real non-blocking source is the next, libc-gated step.
+4. **Transport decision: unix domain socket, *not* TCP** -- for this host (macOS) it is std-only
+   (`std::os::unix::net`), and loopback RPC is the natural fit for an in-process cluster. A real
+   RPC layer over it is a further, separate sub-project (flagged, not built this phase).
+
+### Components
+| File | Role (approx LOC) |
+|------|-------------------|
+| `src/rt.rs`             | `Scheduler` + `block_on` + hand-built `Waker`s; `YieldOnce` cooperative yield point |
+| `src/raft/async_driver.rs` | async API (`put`/`get`/`scan`/`run`) over `RaftCluster`, driven by the runtime |
+| (Phase 3) `src/crc.rs`, `src/valuestore.rs`, `src/snapshot.rs::write_streaming` | carried forward |
+
+New unit tests: `rt::block_on_runs_to_completion`, `rt::await_resumes_cooperatively`, `rt::yields_
+once_then_completes`, `rt::cooperative_interleave_counts` (proves await points are really
+polled-and-resumed, not optimised away); `async_driver::async_workload_converges`,
+`async_driver::async_failover_then_converges` (async workloads converge + stay linearizable).
+
+### Threat & failure audit (Phase 4) -- proven
+- **The runtime genuinely cooperates.** `cooperative_interleave_counts` awaits in a loop and a
+  shared atomic shows every `.await` was polled and resumed -- not a single-poll optimisation.
+- **Async == sync behaviour.** `async_workload_converges` runs 60 replicated puts + 20 reads via
+  one async block on the runtime and the shared `Model` reports **zero violations**; the
+  `async_failover` test kills a node mid-run and still converges -- *async does not change the
+  Raft guarantee*.
+- **Wakers are real and correct.** `wake`/`wake_by_ref` re-queue the task; `clone`/`drop`
+  manage the raw pointer's lifetime (SAFETY-noted). No memory unsafety: every `unsafe` block is
+  a raw-waker pointer with an explicit `// SAFETY` justification.
+
+### Honest limitations (Phase 4) -- not yet covered
+1. **No real async I/O source.** No non-blocking socket/reactor; the boundary is modeled by
+   `YieldOnce`. Non-blocking I/O needs `libc` (out of the no-deps invariant). This is the single
+   biggest honesty gap and the first item Phase 5+ must close if "true async I/O" is required.
+2. **No real network transport / RPC.** The async API is over an in-process cluster. A unix-socket
+   RPC layer (decided above as the transport of record) is a separate sub-project.
+3. **Single-threaded cooperative runtime.** The `Scheduler` runs on one thread; there is no work
+   stealing, no thread pool, no `Send`-across-threads. Adequate for the model, not production.
+4. **RCU reclamation still Phase 1's** `RcuSwap` (RwLock-backed); not revisited for true
+   epoch-based reclamation in this phase (open #3 remains for Phase 5+).
+
+### Evidence (reproduce with `cargo test` and `cargo clippy --all-targets -- -D warnings`)
+- **63 tests pass** in total (55 lib -- incl. the new `rt` + `async_driver` -- plus 3 crash, 1
+  Jepsen-lite, and 4 replication integration tests, all still green).
+- **clippy clean** under `-Dwarnings`; **release build** succeeds.
+- **0 external dependencies**, and the **zero-`unsafe`** target is preserved *except for the
+  unavoidable raw-`Waker` vtable pointers in `src/rt.rs`, each individually `// SAFETY`-annotated
+  (a hand-built runtime cannot avoid the raw-pointer ABI; it is documented per-block).
+
+---
+
+## Phase 5 — Production-grade async I/O + B-tree -- planned
+
+The next, larger phase: a real non-blocking I/O source (needs lifting the no-deps / `libc` gate
+deliberately), a B-tree page store in place of the value-store log, and an epoch-based RCU
+reclamation in place of the `RwLock`-backed `RcuSwap` -- closing open questions 1, 2, and 3.
 
 ---
 

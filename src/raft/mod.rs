@@ -13,6 +13,8 @@
 
 pub mod node;
 pub mod cluster;
+pub mod async_driver;
 
 pub use node::{Cmd, Log, LogEntry, Map, Node, NodeId, Role};
 pub use cluster::{RaftCluster, ClusterError};
+pub use async_driver::{get, put, run, scan};
