@@ -19,6 +19,7 @@ pub mod raft;
 pub mod checker;
 
 pub mod rt;
+pub mod asyncio;
 
 /// Re-export the public entry point at the crate root.
 pub use engine::Store;

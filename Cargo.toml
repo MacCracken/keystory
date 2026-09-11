@@ -6,10 +6,14 @@ rust-version = "1.80"
 description = "Crash-resilient, replicated KV store engine modeled on Raft (Phase 1: single-node)."
 license = "MIT OR Apache-2.0"
 
-# Phase 1 has NO external dependencies: std-only. This honours the
-# "no third-party libraries" constraint (no consensus, no async runtime
-# even; Phase 3 will add tokio, but only for networking, never consensus).
+# Phase 1-4 were std-only (no third-party libraries: no consensus, no async
+# runtime). Phase 5 (3/3) deliberately lifts that gate -- and ONLY that gate --
+# for real, non-blocking I/O via `mio`. Nothing else is added: no consensus
+# crate, no async runtime, no RPC. mio is the single external dependency.
 [dependencies]
+# Phase 5 (3/3): real, non-blocking event-driven I/O. The one external
+# dependency; see src/asyncio.rs for how it is used and why it is the only one.
+mio = { version = "0.8", features = ["os-ext"] }
 
 [lib]
 name = "keystore"
