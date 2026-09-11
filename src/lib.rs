@@ -13,6 +13,7 @@ pub mod snapshot;
 mod crc;
 pub mod valuestore;
 pub mod engine;
+pub mod btree_store;
 pub mod raft;
 pub mod checker;
 
