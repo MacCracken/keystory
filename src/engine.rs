@@ -55,6 +55,12 @@ pub struct Store {
     term: u64,
       /// Highest commit index published so far, mirrored for a lockless `index()`.
     index: Arc<AtomicU64>,
+        /// A B-tree secondary index over live keys, maintained incrementally on each commit
+         /// and rebuilt on `open`. Serves `range_scan` from the tree instead of a per-call
+         /// materialisation. Updated in lockstep with the RCU snapshot (both advanced by the same
+         /// serialised commit; both rebuilt from the same recovered state on `open`), so it can
+         /// never drift from the authoritative data.
+    range_index: Mutex<crate::btree_store::BTree>,
 }
 
 impl std::fmt::Debug for Store {
@@ -108,6 +114,12 @@ impl Store {
         let snap = Snapshot { index: last_index, data };
         let index = Arc::new(AtomicU64::new(last_index));
         let wal = Wal::open(&dir, max_seg_bytes)?;
+            // 5) Rebuild the B-tree secondary index from the same recovered state, so it is in
+             //    step with the snapshot on open (a fresh boot recovers an empty tree).
+        let mut range_index = crate::btree_store::BTree::new();
+        for (k, e) in &snap.data {
+            range_index.insert(k.clone(), e.value.clone());
+               }
         Ok(Store {
             dir,
             commit: Mutex::new(()),
@@ -115,6 +127,7 @@ impl Store {
             wal: Mutex::new(wal),
             term: 1,
             index,
+            range_index: Mutex::new(range_index),
          })
      }
 
@@ -185,24 +198,27 @@ impl Store {
               .map(|(k, e)| (k, e.value))
               .collect()
      }
-        /// Ordered range scan `[lo, hi)` served by the Phase-5 **B-tree store**: the
-        /// published snapshot is materialised into a `btree_store::BTree` and the range
-        /// is read through a genuine B+ traversal -- not a linear walk. Wires the B-tree
-        /// into the live store as its ordered-range query engine. Half-open: `lo` in, `hi` out.
-        ///
-        /// **Honest scope:** the B-tree is built from the snapshot per call (an O(N) build);
-        /// it demonstrates the B-tree as the store's query substrate, not a persistently
-        /// maintained secondary index. The authoritative durable state remains RCU `Snapshot` + WAL.
+          /// Ordered range scan `[lo, hi)` served by the Phase-5 **B-tree secondary index**: the
+          /// store keeps a `btree_store::BTree` over its live keys (rebuilt on `open`, then updated
+          /// on every commit under the commit lock) and serves the range through a genuine B+ 
+          /// traversal -- not a linear walk. Half-open: `lo` in, `hi` out.
+          ///
+          /// **Why maintained, and why it is safe:** the index is advanced by the same serialised
+          /// commit that advances the RCU snapshot, and both are rebuilt from the same recovered
+          /// state on `open` -- so the two views can never drift. A reader taking the index's `Mutex`
+          /// may observe a value slightly older or newer than a snapshot read at the same instant; that
+          /// is the same prior/post-commit-point property the RCU snapshot satisfies, each view being
+          /// individually self-consistent.
+          ///
+          /// **Honest scope:** deletion is a point erase with **no leaf split/merge rebalancing**. The
+          /// index stays *correct* (every present key reachable) but can become unbalanced after many
+          /// deletes; documented as future work, not a correctness gap.
     pub fn range_scan(&self, lo: impl AsRef<[u8]>, hi: impl AsRef<[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let snap = self.snap.load();
         let lo = lo.as_ref().to_vec();
         let hi = hi.as_ref().to_vec();
-        let mut tree = crate::btree_store::BTree::new();
-        for (k, e) in &snap.data {
-            tree.insert(k.clone(), e.value.clone());
-               }
+        let tree = self.range_index.lock().expect("range lock poisoned");
         tree.range(&lo, &hi)
-          }
+            }
 
           // ---- core commit path ----
       /// Serialise, clone-on-write the snapshot, apply the op, durable-append first,
@@ -229,6 +245,18 @@ impl Store {
         let next = Arc::new(Snapshot { index, data });
         self.snap.store(next);
         self.index.store(index, Ordering::Release);
+              // Keep the B-tree secondary index in step with the snapshot just published. Under the
+               // commit lock, the index and the snapshot advance together and can never drift.
+            match op {
+                Op::Put { key, value } => {
+                    let mut t = self.range_index.lock().expect("range lock poisoned");
+                    t.insert(key.clone(), value.clone());
+                        }
+                Op::Delete { key } => {
+                    let mut t = self.range_index.lock().expect("range lock poisoned");
+                    t.delete(key.as_slice());
+                        }
+                 }
 
         Ok(index)
      }
@@ -436,4 +464,31 @@ mod tests {
         let aidx: Vec<u32> = after.iter().map(|(kk, _v)| idx_of(kk)).collect();
         assert!(!aidx.contains(&25), "a deleted key drops out of the range");
            }
+
+        /// The maintained B-tree index tracks BOTH inserts and deletes, staying in step with the
+         /// authoritative snapshot. Put a dense set, delete a strided subset, then prove the index-
+         /// served range equals the snapshot's own scan -- the two views cannot drift.
+     #[test]
+    fn maintained_range_index_tracks_puts_and_deletes() {
+        let (_d, s) = tmp_store("maint", 1 << 20);
+             // 100 zero-padded keys in ascending order.
+        for i in 0..100u32 {
+            s.put(format!("{i:03}"), vec![i as u8]).expect("put");
+              }
+             // Delete every 5th key (0,5,10,...).
+        for i in (0..100u32).step_by(5) {
+            s.delete(format!("{i:03}")).expect("del");
+              }
+             // The index-served full-range scan must equal the snapshot's own scan (authoritative):
+        let via_index = s.range_scan(b"000", b"zzz");
+        let via_snapshot: Vec<(Vec<u8>, Vec<u8>)> = s.scan("");
+        assert_eq!(via_index, via_snapshot,
+          "the maintained B-tree range must equal the authoritative snapshot view");
+             // 100 - 20 deleted = 80 live keys, all ascending, none deleted.
+        let index_keys: Vec<Vec<u8>> = via_index.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(index_keys.len(), 80, "100 minus 20 deleted equals 80 live keys");
+        assert!(index_keys.windows(2).all(|w| w[0] < w[1]), "index stays ascending");
+        assert!(index_keys.iter().all(|k|
+            !(0..100u32).step_by(5).any(|j| k == format!("{j:03}").as_bytes())), "no deleted key survives");
+          }
 }

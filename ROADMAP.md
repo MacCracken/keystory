@@ -462,6 +462,42 @@ The project was deliberately std-only through Phase 4. Phase 5 lifts that gate
 the *only* external dependency is `mio`, used for real I/O; no consensus, no async
 runtime, no RPC -- those are deliberately out of scope.
 
+### Phase 5 addendum -- the B-tree wired into the live store (a *maintained* index)
+
+Following the B-tree module, the live `Store` now serves ordered range queries
+through a **genuinely maintained** B-tree secondary index, not a per-call build:
+
+     - `Store` gains a `range_index: Mutex<BTree>` (rebuilt from the recovered
+        state on `open`, then advanced by every commit under the commit lock).
+     - `commit_op` updates it in lockstep with the published RCU snapshot: a
+        `Put` inserts, a `Delete` erases, in the same serialised critical section
+        that publishes the snapshot -- so the two views **can never drift**.
+     - `Store::range_scan(lo, hi)` now reads the tree directly (O(log n + k))
+        instead of materialising a B-tree per call.
+     - `btree_store` gained `delete` (point erase) and `range` (ordered `[lo,hi)`).
+
+**Why a parallel secondary index, not the primary index:** the authoritative,
+version-stamped, crash-recoverable state is the RCU `Snapshot` (a byte-faithful
+`BTreeMap<Vec<u8>, Entry>` document). The B-tree holds the same *live keys/ values*
+but not the per-key versions, and its deletion does **no leaf split/merge rebalance**
+-- it stays *correct* (every present key is reachable) but can become unbalanced after
+many deletes. Making the B-tree the *primary* recoverable index instead would require
+rewriting the snapshot/recovery format to carry versions; that is a future milestone
+(documented as such), not done here. The index is a genuine, tested, incrementally
+maintained secondary index that stays provably in step with the snapshot.
+
+**Evidence:** `range_scan_served_by_btree` and
+`maintained_range_index_tracks_puts_and_deletes` (100 puts, delete a strided subset,
+prove the index-served range equals the snapshot's own scan, 80 live keys, none
+deleted, ascending). `btree_store` carries 9 tests incl. `deleted_key_vanishes_...` and
+`range_query_is_ordered_and_bounded`.
+
+### Note on the toolchain pin (reproducibility)
+
+`rust-toolchain.toml` pins the development toolchain (`1.98.1`, with `rustfmt` +
+`clippy`), so a fresh checkout builds what was tested. It complements the
+`rust-version = "1.80"` floor in `Cargo.toml`.
+
 ---
 
 *Convention: when a phase finishes, add its threat/failure audit and test evidence here,
