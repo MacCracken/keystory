@@ -7,16 +7,17 @@
 //! rename), and reloaded via [`open`]; a torn or corrupted document is rejected.
 //!
 //! # What this *is* and isn't (honest)
-//! * `insert`, `get`, `scan`, `range` and a point `delete` are implemented; deletion does
-//!   **no** merge/borrow rebalancing, so a leaf may underflow (or empty) after deletes.
+//! * `insert`, `get`, `scan`, `range` and a point `delete` are implemented. Deletion does
+//!   **no** merge/borrow rebalancing, so a leaf may underflow (or empty) after deletes;
+//!   routing stays correct because separators are lower bounds, never leaf contents.
+//! * `range` is a separator-pruned descent, O(log N + k); `scan` takes an arbitrary
+//!   predicate and therefore walks the whole tree; `len` is O(1).
 //! * The tree is an in-memory nested structure serialised whole: there are no fixed-size
 //!   pages, no page ids and no per-page I/O, and each `commit` rewrites the entire document.
-//! * `scan` and `range` are in-order walks of the *whole* tree, not separator-pruned
-//!   descents, so they cost O(N) rather than O(log N + k); `len`/`is_empty` are O(N) too.
-//! * The live `Store` keeps an instance as a *secondary* range index rebuilt on `open`;
-//!   the persistence path here is not used by the store.
+//! * The live `Store` does **not** use this module (Phase 6 removed it as a secondary
+//!   index: the snapshot map already answers range queries). It stands alone, tested.
 //!
-//! The rebalancing and range-cost gaps are tracked in `ROADMAP.md`.
+//! Rebalancing on delete is tracked in `ROADMAP.md`.
 
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -38,8 +39,10 @@ const MAGIC: u32 = 0x4254_5252; // B T R 2
 
 // ---------------- node structure ----------------
 
-/// An internal node: `keys` has `children.len() - 1` entries interleaved between the child
-/// subtrees; `keys[i]` is the least key in `children[i + 1]`.
+/// An internal node: `keys` has `children.len() - 1` separators interleaved between the
+/// child subtrees. `keys[i]` is greater than every key in `children[i]` and a lower bound
+/// for every key in `children[i + 1]` (it was that subtree's least key when promoted;
+/// deletes may since have removed it, which leaves routing unaffected).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Internal {
     keys: Vec<Vec<u8>>,
@@ -80,6 +83,8 @@ struct Split {
 #[derive(Debug, Clone)]
 pub struct BTree {
     root: Node,
+    /// Number of stored keys, maintained on insert/delete so `len` is O(1).
+    len: usize,
 }
 
 impl Default for BTree {
@@ -95,12 +100,17 @@ impl BTree {
             root: Node::Leaf(Leaf {
                 entries: Vec::new(),
             }),
+            len: 0,
         }
     }
 
     /// Insert (or replace) `key -> val`, splitting any overflowing node on the way back up.
     pub fn insert(&mut self, key: Vec<u8>, val: Vec<u8>) {
-        if let Some(split) = insert_rec(&mut self.root, key, val) {
+        let (inserted, split) = insert_rec(&mut self.root, key, val);
+        if inserted {
+            self.len += 1;
+        }
+        if let Some(split) = split {
             // Root overflowed; lift a new single-key root over the two halves.
             let left = std::mem::replace(
                 &mut self.root,
@@ -130,12 +140,9 @@ impl BTree {
         out
     }
 
-    /// The number of stored keys.
+    /// The number of stored keys (O(1)).
     pub fn len(&self) -> usize {
-        match &self.root {
-            Node::Leaf(l) => l.entries.len(),
-            Node::Internal(i) => i.children.iter().map(Node::count).sum(),
-        }
+        self.len
     }
 
     /// Whether the tree is empty.
@@ -146,22 +153,26 @@ impl BTree {
     /// Delete `key` from the tree, if present. Returns whether it was removed.
     ///
     /// This is a **point erase with no rebalancing**: the key is removed from its
-    /// leaf, which may then fall below `MIN_LEAF_KEYS`. The tree stays *correct* --
-    /// routing by `min_leaf_key` and `get`/`scan` remain valid -- but it is no longer
-    /// balanced after heavy deletions. Merging/borrowing to re-balance is a separate,
-    /// explicitly deferred piece (see the module doc-comment).
+    /// leaf, which may then fall below `MIN_LEAF_KEYS` or even empty. The tree stays
+    /// *correct* -- separators are lower bounds, so `get`/`range`/`scan` and later
+    /// splits remain valid -- but it is no longer balanced after heavy deletions.
+    /// Merging/borrowing to re-balance is a separate, explicitly deferred piece.
     pub fn delete(&mut self, key: &[u8]) -> bool {
-        delete_rec(&mut self.root, key)
+        let removed = delete_rec(&mut self.root, key);
+        if removed {
+            self.len -= 1;
+        }
+        removed
     }
 
     /// Collect entries with `lo <= key < hi` in **ascending** order (an ordered range
-    /// query). This is the range counterpart of [`BTree::scan`]; the store builds its
-    /// range scans on it.
+    /// query), descending only into subtrees the separators say can hold such keys:
+    /// O(log N + k). Empty when `lo >= hi`.
     pub fn range(&self, lo: &[u8], hi: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::new();
-        collect(&self.root, &mut out, &|e: &(Vec<u8>, Vec<u8>)| {
-            e.0.as_slice() >= lo && e.0.as_slice() < hi
-        });
+        if lo < hi {
+            collect_range(&self.root, lo, hi, &mut out);
+        }
         out
     }
 
@@ -180,74 +191,74 @@ impl BTree {
 
 // ---------------- insert recursion ----------------
 
-fn insert_rec(node: &mut Node, key: Vec<u8>, val: Vec<u8>) -> Option<Split> {
+/// Insert into the subtree at `node`. Returns whether a *new* key was added (as opposed
+/// to a value replaced) and, if the node overflowed, the split to lift into the parent.
+fn insert_rec(node: &mut Node, key: Vec<u8>, val: Vec<u8>) -> (bool, Option<Split>) {
     match node {
         Node::Leaf(leaf) => {
             let pos = leaf
                 .entries
                 .partition_point(|entry| entry.0.as_slice() < key.as_slice());
-            if pos < leaf.entries.len() && leaf.entries[pos].0 == key {
+            let inserted = if pos < leaf.entries.len() && leaf.entries[pos].0 == key {
                 leaf.entries[pos].1 = val;
+                false
             } else {
                 leaf.entries.insert(pos, (key, val));
-            }
+                true
+            };
             if leaf.entries.len() > ORDER - 1 {
                 let mut entries = std::mem::take(&mut leaf.entries);
                 let mid = entries.len() / 2;
                 let median = entries[mid].0.clone();
                 let right = entries.split_off(mid); // median stays in the right leaf (B+); the key is also copied up
                 leaf.entries = entries;
-                Some(Split {
-                    median,
-                    right: Node::Leaf(Leaf { entries: right }),
-                })
+                (
+                    inserted,
+                    Some(Split {
+                        median,
+                        right: Node::Leaf(Leaf { entries: right }),
+                    }),
+                )
             } else {
-                None
+                (inserted, None)
             }
         }
         Node::Internal(inner) => {
             let i = inner
                 .keys
                 .partition_point(|k| k.as_slice() <= key.as_slice());
-            match insert_rec(&mut inner.children[i], key, val) {
-                Some(split) => {
-                    inner.keys.insert(i, split.median);
-                    inner.children.insert(i + 1, split.right);
-                    if inner.children.len() > ORDER {
-                        let mid = inner.keys.len() / 2;
-                        let right_children = inner.children.split_off(mid + 1);
-                        let right_keys = inner.keys.split_off(mid + 1);
-                        inner.keys.remove(mid);
-                        let right = Node::Internal(Internal {
+            let (inserted, split) = insert_rec(&mut inner.children[i], key, val);
+            let Some(split) = split else {
+                return (inserted, None);
+            };
+            inner.keys.insert(i, split.median);
+            inner.children.insert(i + 1, split.right);
+            if inner.children.len() > ORDER {
+                let mid = inner.keys.len() / 2;
+                let right_children = inner.children.split_off(mid + 1);
+                let right_keys = inner.keys.split_off(mid + 1);
+                // Promote the middle separator itself: it is greater than every key in
+                // the left half and a lower bound for every key in the right half, so it
+                // routes correctly without reading a leaf (which may be empty after deletes).
+                let sep = inner.keys.remove(mid);
+                (
+                    inserted,
+                    Some(Split {
+                        median: sep,
+                        right: Node::Internal(Internal {
                             keys: right_keys,
                             children: right_children,
-                        });
-                        // B+ invariant: parent separator = min leaf key of the right subtree, not keys[mid].
-                        let mut sep = Vec::new();
-                        min_leaf_key(&right, &mut sep);
-                        Some(Split { median: sep, right })
-                    } else {
-                        None
-                    }
-                }
-                None => None,
+                        }),
+                    }),
+                )
+            } else {
+                (inserted, None)
             }
         }
     }
 }
 
 // ---------------- read / scan recursion ----------------
-
-/// The smallest leaf key in `node`'s subtree (the B+ routing key for that subtree).
-fn min_leaf_key(node: &Node, out: &mut Vec<u8>) {
-    match node {
-        Node::Leaf(leaf) => {
-            out.clear();
-            out.extend_from_slice(&leaf.entries[0].0);
-        }
-        Node::Internal(inner) => min_leaf_key(&inner.children[0], out),
-    }
-}
 
 fn get_rec(node: &Node, key: &[u8]) -> Option<Vec<u8>> {
     match node {
@@ -281,6 +292,32 @@ fn delete_rec(node: &mut Node, key: &[u8]) -> bool {
             // Route to the child that owns `key` (same `<=` rule as `get`/`insert`).
             let i = inner.keys.partition_point(|k| k.as_slice() <= key);
             delete_rec(&mut inner.children[i], key)
+        }
+    }
+}
+
+/// Separator-pruned in-order walk for `[lo, hi)`: descends only into subtrees whose
+/// key interval can intersect the range, so the cost is O(log N + k).
+fn collect_range(node: &Node, lo: &[u8], hi: &[u8], out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    match node {
+        Node::Leaf(leaf) => {
+            let start = leaf.entries.partition_point(|(k, _)| k.as_slice() < lo);
+            for (k, v) in &leaf.entries[start..] {
+                if k.as_slice() >= hi {
+                    break;
+                }
+                out.push((k.clone(), v.clone()));
+            }
+        }
+        Node::Internal(inner) => {
+            // `children[i]` holds keys in `[keys[i - 1], keys[i])`, unbounded at the ends.
+            let first = inner.keys.partition_point(|k| k.as_slice() <= lo);
+            for (i, child) in inner.children.iter().enumerate().skip(first) {
+                if i > 0 && inner.keys[i - 1].as_slice() >= hi {
+                    break;
+                }
+                collect_range(child, lo, hi, out);
+            }
         }
     }
 }
@@ -547,7 +584,10 @@ pub fn open(dir: &Path) -> std::io::Result<BTree> {
         ));
     }
     match parse_page(body) {
-        Some(root) => Ok(BTree { root }),
+        Some(root) => {
+            let len = root.count();
+            Ok(BTree { root, len })
+        }
         None => Err(std::io::Error::other("btree.dat undecodable page")),
     }
 }
@@ -765,5 +805,90 @@ mod test {
             got_idx.windows(2).all(|w| w[0] < w[1]),
             "range output must be ascending"
         );
+    }
+
+    /// Regression (Phase 6): emptying a leaf with deletes and then forcing the internal
+    /// split that used to read that leaf's first key must not panic. The promoted
+    /// separator is the parent's own middle key, so contents stay exact throughout.
+    #[test]
+    fn emptied_leaf_then_internal_split_does_not_panic() {
+        let k = |i: u32| i.to_be_bytes().to_vec();
+        let mut t = BTree::new();
+        let mut expected = BTreeMapT::new();
+        for i in 0..=11u32 {
+            t.insert(k(i), vec![1]);
+            expected.insert(k(i), vec![1]);
+        }
+        for i in [6u32, 7] {
+            assert!(t.delete(&k(i)));
+            expected.remove(&k(i));
+        }
+        for i in 12..=60u32 {
+            t.insert(k(i), vec![2]);
+            expected.insert(k(i), vec![2]);
+        }
+        assert_eq!(t.to_sorted_map(), expected);
+        assert_eq!(t.len(), expected.len());
+        for (key, v) in &expected {
+            assert_eq!(t.get(key).as_ref(), Some(v));
+        }
+        assert_eq!(t.get(&k(6)), None);
+    }
+
+    /// The pruned range walk agrees with `BTreeMap::range` on random keys, including
+    /// after deletes have left underfull and empty leaves behind.
+    #[test]
+    fn range_matches_btreemap_on_random_keys_after_deletes() {
+        let mut x = 0x9E37_79B9u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut t = BTree::new();
+        let mut m = BTreeMapT::new();
+        for _ in 0..3000 {
+            let key = (next() % 100_000).to_be_bytes().to_vec();
+            let v = vec![(next() & 0xff) as u8];
+            t.insert(key.clone(), v.clone());
+            m.insert(key, v);
+        }
+        let keys: Vec<Vec<u8>> = m.keys().cloned().collect();
+        for (i, key) in keys.iter().enumerate() {
+            if i % 3 != 0 {
+                assert!(t.delete(key));
+                m.remove(key);
+            }
+        }
+        assert_eq!(t.len(), m.len());
+        for _ in 0..200 {
+            let a = (next() % 100_000).to_be_bytes().to_vec();
+            let b = (next() % 100_000).to_be_bytes().to_vec();
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let want: Vec<(Vec<u8>, Vec<u8>)> = m
+                .range(lo.clone()..hi.clone())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(t.range(&lo, &hi), want, "range [{lo:?}, {hi:?})");
+        }
+        assert!(
+            t.range(b"\xff", b"\x00").is_empty(),
+            "inverted bounds yield nothing"
+        );
+    }
+
+    #[test]
+    fn len_tracks_inserts_replacements_and_deletes() {
+        let mut t = BTree::new();
+        assert!(t.is_empty());
+        t.insert(b"a".to_vec(), b"1".to_vec());
+        t.insert(b"a".to_vec(), b"2".to_vec()); // replacement, not growth
+        t.insert(b"b".to_vec(), b"3".to_vec());
+        assert_eq!(t.len(), 2);
+        assert!(t.delete(b"a"));
+        assert!(!t.delete(b"a"));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.get(b"b"), Some(b"3".to_vec()));
     }
 }

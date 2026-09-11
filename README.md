@@ -24,15 +24,16 @@ is the design log, the threat/failure audit of each phase, and the open backlog.
 
 ## Quick start
 
-The toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on first use.
+The project targets the latest stable Rust (edition 2024); the exact toolchain is
+pinned in `rust-toolchain.toml` and `rustup` installs it on first use.
 
 ```bash
 cargo test --all-targets
 ```
 
-The suite includes three tests that spawn `keystory-crash-runner`, write keys, and
-`kill -9` the child before recovering from disk, plus a Jepsen-lite concurrency
-test, so it takes about a minute and is Unix-only.
+The suite includes four tests that spawn `keystory-crash-runner`, write keys, and
+`kill -9` the child (one of them mid-write) before recovering from disk, plus a
+Jepsen-lite concurrency test, so it takes about a minute and is Unix-only.
 
 ```rust
 use keystory::Store;
@@ -58,7 +59,7 @@ fn main() -> std::io::Result<()> {
 | `src/types.rs` | `Op`, `Entry`, `Snapshot`: the deterministic state model |
 | `src/checker.rs` | Offline MVCC sequential-consistency oracle (Jepsen-lite) |
 | `src/raft/` | Pure Raft FSM, in-process synchronous cluster driver, async facade |
-| `src/btree_store.rs` | Ordered B+ tree with a CRC-guarded document format |
+| `src/btree_store.rs` | Ordered B+ tree with a CRC-guarded document format (standalone, not used by `Store`) |
 | `src/valuestore.rs` | Off-heap blob log for large values (primitive, not yet wired in) |
 | `src/epoch_rcu.rs` | Epoch-based reclamation model (not the hot path) |
 | `src/rt.rs` | Cooperative single-threaded async runtime with hand-built wakers |
@@ -80,9 +81,9 @@ fn main() -> std::io::Result<()> {
 
 Phases 1 to 5 are complete. A full review on 2026-09-11 found bugs and design gaps
 that the phase gates missed; they are being worked through as Phase 6 in
-`ROADMAP.md`. The headline items: the Raft layer does not yet use the durable store,
-every commit clones the whole map, there is no group commit, and the B-tree range
-index is being reconsidered.
+`ROADMAP.md`. The confirmed bugs are fixed; the headline design items still open are
+that the Raft layer does not yet use the durable store, every commit clones the whole
+map, and there is no group commit.
 
 ## Development
 
@@ -90,7 +91,6 @@ index is being reconsidered.
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-cargo +1.81 check --all-targets   # MSRV
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of the above plus the test suite on Linux

@@ -27,15 +27,22 @@
 //! discarded. Hence recovery loses **at most the last un-`fsync`-ed record** and
 //! nothing else: exactly the invariant the task demands.
 //!
-//! ## Segmentation and truncation
+//! A torn tail is only legitimate in the **last** segment: a crash interrupts at most
+//! one append. A bad record in an earlier segment, with later segments present, is not
+//! a crash artefact but corruption, and [`replay`] refuses to skip past it.
+//!
+//! ## Segmentation, repair, truncation
 //!
 //! A segment rotates into a new file once it would exceed `Wal::max_seg_bytes`.
-//! Names embed a 10-digit monotone sequence so a glob-and-sort yields the correct
-//! append order. After a durable snapshot, the engine deletes the segments fully
-//! covered by it (WAL-tail recovery for the next boot).
+//! Names embed a 10-digit monotone sequence so a sort yields the append order.
+//! [`Wal::open`] resumes the latest segment, first truncating any torn tail it finds
+//! so new records always start on a clean record boundary. Creating or rotating a
+//! segment `fsync`s the directory, so the new file's existence is as durable as its
+//! bytes. After a durable checkpoint the engine calls [`Wal::truncate_all`], which
+//! deletes every segment and starts a fresh one; nothing else ever deletes the log.
 
-use std::fs::{create_dir_all, remove_file, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{File, OpenOptions, create_dir_all, remove_file};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::crc::crc32;
@@ -52,6 +59,15 @@ pub struct Record {
     pub op: Op,
 }
 
+/// Where [`replay`] found a torn (partial or corrupt) trailing record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TornTail {
+    /// The segment holding the torn record.
+    pub segment: PathBuf,
+    /// Byte offset of the torn record's first byte; every byte before it is intact.
+    pub offset: u64,
+}
+
 /// Durable, segmented WAL rooted at a directory.
 pub struct Wal {
     dir: PathBuf,
@@ -64,14 +80,29 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// Open (creating if needed) a fresh log in `dir`. Existing segment files
-    /// are left intact so the caller can [`replay`] them first.
+    /// Open the log in `dir`, creating the directory and a first segment if needed.
+    ///
+    /// Resumes the latest existing segment. If that segment ends in a torn record (a
+    /// crash mid-append), the tail is truncated first, so the next append lands on a
+    /// clean boundary and a later [`replay`] sees one contiguous, intact log. Earlier
+    /// segments are left untouched for the caller to [`replay`].
     pub fn open(dir: impl AsRef<Path>, max_seg_bytes: u64) -> io::Result<Wal> {
         let dir = dir.as_ref().to_path_buf();
-        make_dir(&dir)?;
-        let seq = next_segment_seq(&dir);
-        let path = segment_path(&dir, seq);
+        create_dir_all(&dir)?;
+        let mut segs = list_segments(&dir)?;
+        segs.sort();
+        let (seq, path) = match segs.last() {
+            Some(p) => (segment_seq(p).expect("listed segments parse"), p.clone()),
+            None => (1, segment_path(&dir, 1)),
+        };
+        let resumed = path.exists();
+        if resumed {
+            repair_tail(&path)?;
+        }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        if !resumed {
+            fsync_dir(&dir)?; // the new segment's directory entry is durable too.
+        }
         let seg_bytes = file.metadata()?.len();
         Ok(Wal {
             dir,
@@ -107,14 +138,13 @@ impl Wal {
         self.file.sync_all()?;
         self.seg_seq += 1;
         let path = segment_path(&self.dir, self.seg_seq);
-        let f = OpenOptions::new()
+        self.file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(&path)?;
-        self.file = f;
         self.seg_bytes = 0;
-        Ok(())
+        fsync_dir(&self.dir) // the new segment's directory entry is durable too.
     }
 
     /// Durably flush the current on-disk state (e.g. before a snapshot
@@ -123,89 +153,102 @@ impl Wal {
         self.file.sync_all()
     }
 
-    /// Delete every segment file in this log. Call after a durable snapshot
-    /// that fully covers their contents; subsequent commits start a fresh
-    /// segment.
+    /// Delete every segment file in this log, then start a fresh one. Call only after
+    /// a durable snapshot that fully covers their contents.
     pub fn truncate_all(&mut self) -> io::Result<()> {
         for p in list_segments(&self.dir)? {
             // Best-effort; a missing file is fine.
             let _ = remove_file(&p);
         }
         // Open a fresh segment so subsequent appends write to a clean file.
-        self.rotate()?;
-        Ok(())
+        self.rotate()
     }
 }
 
 /// Replay every segment in `dir` in filename (i.e. append) order.
 ///
-/// A torn trailing record is *silently dropped*: records before it are complete
-/// and durable. Returns `(records, dropped_at)`, where `dropped_at` is the byte
-/// offset within the offending segment at which a partial/undecodable record was
-/// detected (`None` when every segment ended cleanly). Only an `io::Error` (e.g.
-/// a directory that cannot be read) is a hard failure; a torn tail is **not**.
-pub fn replay(dir: impl AsRef<Path>) -> io::Result<(Vec<Record>, Option<u64>)> {
-    let dir = dir.as_ref();
-    let mut out = Vec::new();
-    let mut dropped_at: Option<u64> = None;
-    let mut files = list_segments(dir)?;
+/// Returns `(records, torn)`. A torn trailing record in the **last** segment is dropped
+/// and reported in `torn`: the records before it are complete and durable, and that is
+/// not an error. A bad record in any *earlier* segment is corruption, not a crash tail,
+/// and is returned as an `InvalidData` error rather than silently truncating history.
+pub fn replay(dir: impl AsRef<Path>) -> io::Result<(Vec<Record>, Option<TornTail>)> {
+    let mut files = list_segments(dir.as_ref())?;
     files.sort();
-    for path in &files {
-        // `?` propagates only real io errors; a torn tail is reported in-band.
-        let (mut recs, at) = replay_one_segment(path)?;
-        out.append(&mut recs);
-        if let Some(at) = at {
-            dropped_at = Some(at);
-            // The torn tail belongs to this (latest) segment, so no later segment
-            // can contain anything durable.
-            break;
+    let mut out = Vec::new();
+    for (i, path) in files.iter().enumerate() {
+        if let Some(offset) = scan_segment(path, |r| out.push(r))? {
+            let later = files.len() - 1 - i;
+            if later > 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL segment {} is corrupt at byte {offset} but {later} later segment(s) \
+                         exist; refusing to replay past corruption",
+                        path.display()
+                    ),
+                ));
+            }
+            return Ok((
+                out,
+                Some(TornTail {
+                    segment: path.clone(),
+                    offset,
+                }),
+            ));
         }
     }
-    Ok((out, dropped_at))
+    Ok((out, None))
 }
 
-/// Parse a single segment into its records.
-///
-/// Returns `(complete_records, tail_off)` where a well-formed log yields
-/// `tail_off == None`. A short, corrupt, or CRC-failing trailing record yields
-/// the *complete records before it* plus `Some(offset)`; that is not an error.
-fn replay_one_segment(path: &Path) -> io::Result<(Vec<Record>, Option<u64>)> {
-    let mut f = File::open(path)?;
-    let len = f.metadata()?.len();
+/// Walk one segment, handing each intact record to `sink` in order. Returns the byte
+/// offset of the first torn or undecodable record, or `None` if the segment ends
+/// cleanly. Every read is bounded, so a truncated file yields an offset, not a panic.
+fn scan_segment(path: &Path, mut sink: impl FnMut(Record)) -> io::Result<Option<u64>> {
+    let len = std::fs::metadata(path)?.len();
+    let mut f = BufReader::new(File::open(path)?);
     let mut pos: u64 = 0;
-    let mut out = Vec::new();
     loop {
         if pos + 4 > len {
             // Fewer than 4 header bytes remain: a clean end when we are exactly at
             // `len`, otherwise an overhang to drop.
-            return if pos == len {
-                Ok((out, None))
-            } else {
-                Ok((out, Some(pos)))
-            };
+            return Ok(if pos == len { None } else { Some(pos) });
         }
         let mut lb = [0u8; 4];
         f.read_exact(&mut lb)?; // safe: pos + 4 <= len
-        let payload_len = u32::from_le_bytes(lb) as u64;
-        if payload_len < MIN_PAYLOAD as u64 {
-            return Ok((out, Some(pos))); // short/corrupt header => torn tail
+        let payload_len = u64::from(u32::from_le_bytes(lb));
+        if payload_len < u64::from(MIN_PAYLOAD) {
+            return Ok(Some(pos)); // short/corrupt header => torn tail
         }
         let total = 4 + payload_len + 4;
         if pos + total > len {
-            return Ok((out, Some(pos))); // record not fully present => torn tail
+            return Ok(Some(pos)); // record not fully present => torn tail
         }
         let mut pbuf = vec![0u8; payload_len as usize];
         f.read_exact(&mut pbuf)?;
         let mut cb = [0u8; 4];
         f.read_exact(&mut cb)?;
         if crc32(&pbuf) != u32::from_le_bytes(cb) {
-            return Ok((out, Some(pos))); // crc mismatch => torn tail
+            return Ok(Some(pos)); // crc mismatch => torn tail
         }
         match decode_payload(&pbuf) {
-            Ok(rec) => out.push(rec),
-            Err(_) => return Ok((out, Some(pos))), // undecodable => torn tail
+            Ok(rec) => sink(rec),
+            Err(_) => return Ok(Some(pos)), // undecodable => torn tail
         }
         pos += total;
+    }
+}
+
+/// Truncate a torn trailing record off `path`, if there is one. Returns the offset the
+/// file was cut to, or `None` if it was already clean.
+fn repair_tail(path: &Path) -> io::Result<Option<u64>> {
+    match scan_segment(path, |_| {})? {
+        Some(off) => {
+            let f = OpenOptions::new().write(true).open(path)?;
+            f.set_len(off)?;
+            f.sync_all()?;
+            Ok(Some(off))
+        }
+        None => Ok(None),
     }
 }
 
@@ -238,39 +281,40 @@ fn encode_payload(rec: &Record) -> Vec<u8> {
 }
 
 fn decode_payload(b: &[u8]) -> Result<Record, io::Error> {
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
     let mut cur = 0;
     if cur >= b.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty"));
+        return Err(bad("empty"));
     }
     let tag = b[cur];
     cur += 1;
     if cur + 8 > b.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "term"));
+        return Err(bad("term"));
     }
     let term = u64::from_le_bytes(b[cur..cur + 8].try_into().expect("term len"));
     cur += 8;
     if cur + 8 > b.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "index"));
+        return Err(bad("index"));
     }
     let index = u64::from_le_bytes(b[cur..cur + 8].try_into().expect("index len"));
     cur += 8;
     if cur + 4 > b.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "k_len"));
+        return Err(bad("k_len"));
     }
     let k_len = u32::from_le_bytes(b[cur..cur + 4].try_into().expect("k_len")) as usize;
     cur += 4;
     if cur + k_len > b.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "key body"));
+        return Err(bad("key body"));
     }
     let key = b[cur..cur + k_len].to_vec();
     cur += k_len;
     if cur + 4 > b.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "v_len"));
+        return Err(bad("v_len"));
     }
     let v_len = u32::from_le_bytes(b[cur..cur + 4].try_into().expect("v_len")) as usize;
     cur += 4;
     if cur + v_len > b.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "val body"));
+        return Err(bad("val body"));
     }
     let op = match tag {
         1 => Op::Put {
@@ -278,7 +322,7 @@ fn decode_payload(b: &[u8]) -> Result<Record, io::Error> {
             value: b[cur..cur + v_len].to_vec(),
         },
         2 => Op::Delete { key },
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad tag")),
+        _ => return Err(bad("bad tag")),
     };
     Ok(Record { term, index, op })
 }
@@ -291,48 +335,43 @@ fn segment_path(dir: &Path, seq: u32) -> PathBuf {
     dir.join(format!("wal-{seq:010}.log"))
 }
 
-fn make_dir(dir: &Path) -> io::Result<()> {
-    match create_dir_all(dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
-    }
+/// The sequence number embedded in a segment file name, if it is one.
+fn segment_seq(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("wal-")?
+        .strip_suffix(".log")?
+        .parse::<u32>()
+        .ok()
 }
 
-fn next_segment_seq(dir: &Path) -> u32 {
-    let mut seq = 0u32;
-    for p in list_segments(dir).into_iter().flatten() {
-        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if let Some(rest) = name
-                .strip_prefix("wal-")
-                .and_then(|s| s.strip_suffix(".log"))
-            {
-                if let Ok(n) = rest.parse::<u32>() {
-                    seq = seq.max(n);
-                }
-            }
-        }
-    }
-    seq + 1
-}
-
+/// Every segment file in `dir`, in no particular order (callers sort).
 pub fn list_segments(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut vec: Vec<PathBuf> = Vec::new();
     if !dir.exists() {
         return Ok(vec);
     }
     for e in std::fs::read_dir(dir)? {
-        let e = e?;
-        let name = e.file_name();
-        if name
-            .to_str()
-            .map(|s| s.starts_with("wal-") && s.ends_with(".log"))
-            .unwrap_or(false)
-        {
-            vec.push(e.path());
+        let p = e?.path();
+        if segment_seq(&p).is_some() {
+            vec.push(p);
         }
     }
     Ok(vec)
+}
+
+/// `fsync` a directory so a just-created, renamed or deleted entry is durable: POSIX
+/// makes no promise about the entry until the directory itself is synced. A no-op on
+/// platforms where a directory cannot be opened as a file.
+pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -353,66 +392,53 @@ mod tests {
         d
     }
 
+    fn put(index: u64, key: &[u8], value: &[u8]) -> Record {
+        Record {
+            term: 1,
+            index,
+            op: Op::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+        }
+    }
+
+    fn append_junk(seg: &Path) {
+        let mut f = OpenOptions::new().append(true).open(seg).unwrap();
+        // A plausible length header (0xFF) followed by far fewer bytes than it claims.
+        f.write_all(&[0xFF, 0x00, 0x00, 0x00, 0x01, 0x00]).unwrap();
+    }
+
+    fn only_segment(d: &Path) -> PathBuf {
+        let segs = list_segments(d).unwrap();
+        assert_eq!(segs.len(), 1, "expected exactly one segment, got {segs:?}");
+        segs[0].clone()
+    }
+
     #[test]
     fn roundtrip_put_and_delete() {
         let d = dir("wal-rt");
         let mut w = Wal::open(&d, 4096).unwrap();
-        w.append(&Record {
-            term: 1,
-            index: 1,
-            op: Op::Put {
-                key: b"a".into(),
-                value: b"1".into(),
-            },
-        })
-        .unwrap();
+        w.append(&put(1, b"a", b"1")).unwrap();
         w.append(&Record {
             term: 1,
             index: 2,
             op: Op::Delete { key: b"a".into() },
         })
         .unwrap();
-        w.append(&Record {
-            term: 1,
-            index: 3,
-            op: Op::Put {
-                key: b"z".into(),
-                value: b"\x00\x01\xff".into(),
-            },
-        })
-        .unwrap();
+        w.append(&put(3, b"z", b"\x00\x01\xff")).unwrap();
         let got = recs_clean(&d);
         assert_eq!(got.len(), 3);
-        assert_eq!(
-            got[0],
-            Record {
-                term: 1,
-                index: 1,
-                op: Op::Put {
-                    key: b"a".into(),
-                    value: b"1".into()
-                }
-            }
-        );
+        assert_eq!(got[0], put(1, b"a", b"1"));
         assert_eq!(
             got[1],
             Record {
                 term: 1,
                 index: 2,
-                op: Op::Delete { key: b"a".into() }
+                op: Op::Delete { key: b"a".into() },
             }
         );
-        assert_eq!(
-            got[2],
-            Record {
-                term: 1,
-                index: 3,
-                op: Op::Put {
-                    key: b"z".into(),
-                    value: b"\x00\x01\xff".into()
-                }
-            }
-        );
+        assert_eq!(got[2], put(3, b"z", b"\x00\x01\xff"));
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -420,24 +446,71 @@ mod tests {
     fn torn_tail_is_dropped_cleanly() {
         let d = dir("wal-torn");
         let mut w = Wal::open(&d, 1024).unwrap();
-        w.append(&Record {
-            term: 1,
-            index: 1,
-            op: Op::Put {
-                key: b"k".into(),
-                value: b"v".into(),
-            },
-        })
-        .unwrap();
-        // Simulate a torn tail: append non-record junk without fsync.
-        let seg = d.join("wal-0000000001.log");
-        {
-            let mut f = OpenOptions::new().append(true).open(&seg).unwrap();
-            f.write_all(&[0xFF, 0xFF, 0x00, 0x00, 0x01, 0x00]).unwrap();
-        }
+        w.append(&put(1, b"k", b"v")).unwrap();
+        let seg = only_segment(&d);
+        let clean_len = std::fs::metadata(&seg).unwrap().len();
+        append_junk(&seg); // simulate a torn tail: junk without fsync.
         let (got, dropped) = replay(&d).unwrap();
         assert_eq!(got.len(), 1, "only the durable record survives");
-        assert!(dropped.is_some(), "a torn tail must be detected");
+        let torn = dropped.expect("a torn tail must be detected");
+        assert_eq!(torn.segment, seg);
+        assert_eq!(
+            torn.offset, clean_len,
+            "the tail starts where the intact records end"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Reopening resumes the latest segment and repairs its torn tail, so records
+    /// appended afterwards follow the intact ones and replay cleanly.
+    #[test]
+    fn open_repairs_torn_tail_and_resumes_the_segment() {
+        let d = dir("wal-repair");
+        {
+            let mut w = Wal::open(&d, 4096).unwrap();
+            w.append(&put(1, b"a", b"1")).unwrap();
+        }
+        let seg = only_segment(&d);
+        let clean_len = std::fs::metadata(&seg).unwrap().len();
+        append_junk(&seg);
+        {
+            let mut w = Wal::open(&d, 4096).unwrap();
+            assert_eq!(
+                std::fs::metadata(&seg).unwrap().len(),
+                clean_len,
+                "open truncates the torn tail"
+            );
+            w.append(&put(2, b"b", b"2")).unwrap();
+        }
+        assert_eq!(
+            only_segment(&d),
+            seg,
+            "the same segment was resumed, not a new one"
+        );
+        let got = recs_clean(&d);
+        assert_eq!(got, vec![put(1, b"a", b"1"), put(2, b"b", b"2")]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A bad record in a non-final segment is corruption, not a crash tail: replay must
+    /// refuse rather than silently drop every later segment.
+    #[test]
+    fn corruption_before_a_later_segment_is_an_error() {
+        let d = dir("wal-corrupt");
+        let mut w = Wal::open(&d, 64).unwrap(); // tiny threshold forces rotation
+        for i in 0..10u64 {
+            w.append(&put(i + 1, format!("k{i}").as_bytes(), b"v"))
+                .unwrap();
+        }
+        let mut segs = list_segments(&d).unwrap();
+        segs.sort();
+        assert!(segs.len() >= 2, "expected rotation");
+        let first = &segs[0];
+        let mut bytes = std::fs::read(first).unwrap();
+        bytes[10] ^= 0xFF; // flip a byte inside the first record's payload
+        std::fs::write(first, &bytes).unwrap();
+        let err = replay(&d).expect_err("corruption followed by later segments is an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -446,15 +519,8 @@ mod tests {
         let d = dir("wal-rot");
         let mut w = Wal::open(&d, 64).unwrap(); // tiny threshold forces rotation
         for i in 0..50u64 {
-            w.append(&Record {
-                term: 1,
-                index: i + 1,
-                op: Op::Put {
-                    key: format!("k{i}").into_bytes(),
-                    value: i.to_le_bytes().into(),
-                },
-            })
-            .unwrap();
+            w.append(&put(i + 1, format!("k{i}").as_bytes(), &i.to_le_bytes()))
+                .unwrap();
         }
         let got = recs_clean(&d);
         assert_eq!(got.len(), 50);
@@ -468,14 +534,7 @@ mod tests {
     #[test]
     fn crc_detects_bit_flip() {
         // A flipped byte in a committed record's body must fail its crc guard.
-        let good = Record {
-            term: 7,
-            index: 42,
-            op: Op::Put {
-                key: b"key".into(),
-                value: b"value".into(),
-            },
-        };
+        let good = put(42, b"key", b"value");
         let payload = encode_payload(&good);
         assert_eq!(crc32(&payload), crc32(&payload));
         let mut bad = payload.clone();

@@ -22,7 +22,7 @@
 //! The non-blocking path is Unix in this iteration (a Unix-stream pair needs no
 //! network and is fully self-contained); the module is Unix-only.
 
-use mio::{event::Source, unix::SourceFd, Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, event::Source, unix::SourceFd};
 
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;

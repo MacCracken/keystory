@@ -36,8 +36,8 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
 };
 
 // This is a single-producer, cooperative *model* of epoch reclamation: the retiree is
@@ -242,8 +242,8 @@ mod test {
     fn later_reader_does_not_block_earlier_retiree() {
         let rc = Rcu::new(0u32);
         rc.publish(1); // retiree ep = 1 (no one active yet)
-                       // A reader that enters NOW (epoch 1) does NOT hold the v1-erased version... but it
-                       // entered after the retiree, so it must not block that retiree.
+        // A reader that enters NOW (epoch 1) does NOT hold the v1-erased version... but it
+        // entered after the retiree, so it must not block that retiree.
         let r = _enter(&rc);
         assert_eq!(
             rc.reclaim(),

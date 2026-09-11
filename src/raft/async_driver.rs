@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::raft::{ClusterError, RaftCluster};
-use crate::rt::{yield_once, Scheduler};
+use crate::rt::{Scheduler, yield_once};
 
 /// Run a single `'static` async workload to completion on a fresh cooperative scheduler.
 ///
@@ -116,13 +116,12 @@ mod test {
             }
         });
 
-        // Force failover: kill node 3 (the deterministic leader), then keep writing through
-        // a new leader.
-        cluster.fail(3);
-        assert!(
-            cluster.leader().is_some(),
-            "a quorum (2 of 3) remains, so a leader re-emerges"
-        );
+        // Force a real failover: kill the current leader, then keep writing. The next
+        // replicated op must elect a different node (a quorum of 2 of 3 remains).
+        let old_leader = cluster
+            .leader()
+            .expect("the first workload elected a leader");
+        cluster.fail(old_leader);
 
         let c2 = cluster.clone();
         run(async move {
@@ -134,6 +133,14 @@ mod test {
                 let _ = get(c, vec![b'x', 1u8]).await.unwrap();
             }
         });
+
+        let new_leader = cluster
+            .leader()
+            .expect("a quorum (2 of 3) remains, so a leader re-emerges");
+        assert_ne!(
+            new_leader, old_leader,
+            "failover must move leadership off the failed node"
+        );
 
         let r = model_check_check(&model);
         assert!(

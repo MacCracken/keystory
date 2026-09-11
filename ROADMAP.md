@@ -50,8 +50,9 @@ mechanism and a Jepsen-lite linearisability checker.
   nothing — correct under exact *or* at-least-once log replay; the version bumps only on
   a real state change (an exactly-once log, e.g. Raft, would *not* bump it).
 - **Recovery = load the last snapshot (O(1) in log length) + replay only WAL records
-  newer than it + reclaim the consumed WAL.** Torn trailing records are dropped, never
-  trusted.
+  newer than it.** Torn trailing records are dropped, never trusted. (Phase 1 also
+  deleted the WAL at open; Phase 6 found that lost data on a second reopen and moved
+  reclamation to `checkpoint()` only.)
 - **The logical commit index total-orders events** (not wall-clock time). `term` is a
   single node's Raft term (always `1` here) — the field is reserved for the log format
   Raft will need, with no behaviour yet.
@@ -467,6 +468,13 @@ runtime, no RPC -- those are deliberately out of scope.
 
 ### Phase 5 addendum -- the B-tree wired into the live store (a *maintained* index)
 
+> **Superseded in Phase 6 (2026-09-11).** The maintained index was removed from `Store`:
+> its `range` was a full-tree walk (measured about 800× slower than `BTreeMap::range` at
+> 200k keys, so the "O(log n + k)" claim below was false), and a delete that emptied a
+> leaf could panic inside the commit lock, poisoning it. `Store::range_scan` is now served
+> from the snapshot map in O(log n + k). `btree_store` remains a standalone, tested module
+> with the panic fixed, a separator-pruned `range`, and an O(1) `len`.
+
 Following the B-tree module, the live `Store` now serves ordered range queries
 through a **genuinely maintained** B-tree secondary index, not a per-call build:
 
@@ -517,8 +525,9 @@ item is ticked as it lands.
       the stray `rustup-init.sh` removed from the repository.
 - [x] Package renamed `keystore` → `keystory` to match the repository and this document
       (binary: `keystory-crash-runner`).
-- [x] `rust-version` corrected to `1.81` (the lint `reason = "..."` attributes in
-      `src/rt.rs` require it); verified with `cargo +1.81 check --all-targets`.
+- [x] The project targets the **latest stable Rust** by decision: edition 2024, and
+      `rust-version` tracks the pinned toolchain (1.98) rather than an older floor. (The
+      1.81 floor and its CI job from the first pass were dropped.)
 - [x] `mio` bumped 0.8 → 1.x; the Unix-only `asyncio` module gated with `#[cfg(unix)]`
       so the crate builds on Windows.
 - [x] Stale docs corrected (crate description, `lib.rs`, `engine`, `rt`, `rcu`, `types`,
@@ -531,28 +540,43 @@ item is ticked as it lands.
       on a missing `<dir>` and `run` really defaults to 1000 keys; integration tests use a
       `tests/common::TempDir` guard so failed runs do not leak directories.
 
-### Batch 2 — confirmed bugs — planned
+### Batch 2 — confirmed bugs — **DONE** ✅
 
-- [ ] `Store::open` deletes the WAL before anything re-persists the recovered state:
-      reopening twice without a checkpoint loses every WAL-recovered key.
-- [ ] The B-tree range index can panic (an emptied leaf is lifted as a separator after
-      deletes), poisoning the commit lock and bricking the store; its `range` is an O(N)
-      walk (about 800× slower than `BTreeMap::range` at 200k keys). Decision pending:
-      fix, or drop the index and serve ranges from the snapshot map.
-- [ ] The Jepsen-lite test stops its readers immediately (about 12% of the intended
-      reads run).
-- [ ] `RaftCluster::get` panics after `revive` (a revived node counts as live before it
-      is caught up).
-- [ ] `async_failover_then_converges` fails node id 3 in a 3-node cluster (ids 0..2), so
-      nothing fails over.
-- [ ] Crash tests only kill the child after all writes are durable; add a mid-write kill
-      with a prefix-consistency check.
+- [x] `Store::open` no longer deletes the WAL; only `checkpoint()` reclaims it.
+      `Wal::open` resumes the latest segment and truncates a torn tail first, so appends
+      after a crash land on a clean boundary (`reopen_without_checkpoint_keeps_wal_data`,
+      `open_repairs_torn_tail_then_keeps_appending`).
+- [x] The B-tree index is gone from `Store`; `range_scan` reads the snapshot map
+      (`Snapshot::range`, O(log n + k), empty for inverted bounds). In `btree_store` the
+      internal split now promotes the parent's middle separator instead of reading a leaf
+      (`emptied_leaf_then_internal_split_does_not_panic`), `range` prunes by separator
+      (`range_matches_btreemap_on_random_keys_after_deletes`), and `len` is O(1).
+- [x] Jepsen-lite readers now run, paced, for the whole writer run (joined after the
+      writers; the check requires at least 1,000 recorded reads), and the lost-update
+      test has readers too, so its check is no longer vacuous.
+- [x] `RaftCluster::get`/`scan` are leader reads: they require a live quorum, catch every
+      live follower up first, then serve the leader's state -- a revived node is caught up
+      on its next read or write (`get_after_revive_catches_the_node_up`).
+- [x] `async_failover_then_converges` now fails the actual leader and asserts leadership
+      moved.
+- [x] `sigkill_mid_write_recovers_a_consistent_prefix`: kill the runner while it is still
+      writing, recover a contiguous prefix, then write and reopen again.
+
+Also closed here, pulled forward from batch 3 because the fixes above needed them:
+
+- [x] A leader is sticky: `ensure_leader` elects only when there is no live leader (and a
+      leader whose quorum is gone steps down), so the term no longer climbs per write
+      (`leader_is_sticky_across_writes`).
+- [x] `checker::Model::check` sorts each key's write log by index before validating, so
+      writers may record out of order (`out_of_order_recording_is_sorted_before_checking`).
+- [x] WAL segment creation and rotation `fsync` the directory (`wal::fsync_dir`, also used
+      by the checkpoint rename, whose failure now propagates instead of being ignored).
+- [x] A bad record in a non-final WAL segment is reported as `InvalidData` instead of being
+      treated like a crash tail (`corruption_before_a_later_segment_is_an_error`).
 
 ### Batch 3 — design gaps — planned
 
 - [ ] Raft is not layered on the durable engine (nodes keep in-memory logs and state).
-- [ ] Every replicated write runs a full election (`ensure_leader` always elects), so the
-      term climbs by one per write.
 - [ ] Raft FSM deviations: `voted_for` is reset on every `AppendEntries`; no conflict
       check at `prev_index + 1` on append (a redelivered message corrupts the log); the
       mismatch path truncates the matching entry itself.
@@ -560,10 +584,10 @@ item is ticked as it lands.
       100k keys × 1 KiB). Cheapest mitigation: `Arc<[u8]>` values; real fix: a
       structurally shared persistent map.
 - [ ] One `fsync` per put and no batch API; group commit is the largest available win.
-- [ ] WAL and checkpoint durability details: no directory `fsync` on segment create or
-      rotate; corruption in a non-final segment is treated like a torn tail;
-      `checkpoint()` blocks writers for the whole write; a corrupt snapshot has no older
-      generation to fall back to.
+- [ ] Checkpoint details: `checkpoint()` blocks writers for the whole snapshot write
+      (the snapshot is immutable, so the write could happen outside the commit lock if
+      the WAL learned to truncate only the segments a checkpoint covers); a corrupt
+      snapshot has no older generation to fall back to.
 - [ ] `rt`: the `wake` vtable entry leaks its `RawWaker` data (std requires `wake` to
       release it); task slots never compact; `add` from inside a task deadlocks.
 - [ ] `asyncio::round_trip` never times out (loops on an empty poll) and never sets the
@@ -572,7 +596,7 @@ item is ticked as it lands.
       releases its lock mid-rewrite (a concurrent `put` is lost), and trusts the on-disk
       length before allocating.
 - [ ] `epoch_rcu::Rcu` is not `Sync` (it stores `Arc<Box<dyn Any>>`), so it cannot be
-      shared across threads; the checker assumes per-key writes arrive in index order.
+      shared across threads.
 
 ---
 

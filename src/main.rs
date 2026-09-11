@@ -18,7 +18,7 @@
 
 use keystory::Store;
 use std::path::{Path, PathBuf};
-use std::process::{exit, Command};
+use std::process::{Command, exit};
 
 /// Sub-command: durably write `n` keys, signal "done", then block until killed.
 fn run(dir: &Path, n: u64) {

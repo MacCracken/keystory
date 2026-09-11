@@ -43,6 +43,28 @@ fn force_kill(pid: u32) {
     let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
 }
 
+/// Poll until the WAL segments in `dir` hold at least `min_bytes`, i.e. the child has
+/// durably written several records. Never opens the store while the child owns it.
+fn wait_for_wal_bytes(dir: &Path, min_bytes: u64, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let total: u64 = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("wal-"))
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        if total >= min_bytes {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("timed out waiting for {min_bytes} WAL bytes after {timeout:?}");
+}
+
 #[test]
 fn survives_sigkill_then_recovers_full_state() {
     let tmp = TempDir::new("sigkill");
@@ -171,4 +193,53 @@ fn checkpoint_then_crash_recovers_from_snapshot_plus_tail() {
             Some(format!("v{i:08}").into_bytes())
         );
     }
+}
+
+/// SIGKILL the runner *while it is still writing*: the WAL may end in a torn record.
+/// Recovery must yield exactly the keys `k0..k(m-1)` for some `m >= 1` -- a prefix of
+/// the write order, nothing missing, nothing extra -- and the repaired log must keep
+/// accepting and replaying writes across another open.
+#[test]
+fn sigkill_mid_write_recovers_a_consistent_prefix() {
+    let tmp = TempDir::new("mid-write");
+    let dir = tmp.path();
+
+    // Far more keys than can be written before the kill lands.
+    let mut child = Command::new(crash_bin())
+        .arg("run")
+        .arg(dir)
+        .arg("1000000")
+        .spawn()
+        .expect("spawn crash-runner");
+    wait_for_wal_bytes(dir, 2048, Duration::from_secs(30));
+    force_kill(child.id());
+    let _ = child.wait();
+
+    let s = keystory::Store::open(dir).expect("recover after a mid-write SIGKILL");
+    let m = s.len() as u64;
+    assert!(m >= 1, "some records were durable before the kill");
+    for i in 0..m {
+        assert_eq!(
+            s.get(format!("k{i:08}").as_bytes()),
+            Some(format!("v{i:08}").into_bytes()),
+            "key {i} of the recovered prefix"
+        );
+    }
+    assert_eq!(
+        s.get(format!("k{m:08}").as_bytes()),
+        None,
+        "nothing beyond the prefix"
+    );
+
+    // The repaired log keeps working: a write after recovery survives another open.
+    s.put(b"after-crash", b"1").expect("write after recovery");
+    drop(s);
+    let s2 = keystory::Store::open(dir).expect("second recovery");
+    assert_eq!(
+        s2.len() as u64,
+        m + 1,
+        "prefix plus the post-recovery write"
+    );
+    assert_eq!(s2.get(b"after-crash"), Some(b"1".to_vec()));
+    assert_eq!(s2.get(b"k00000000"), Some(b"v00000000".to_vec()));
 }

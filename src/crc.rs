@@ -85,9 +85,9 @@ fn concat_two(a: &[u8], b: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod test {
+    use super::Crc;
     use super::concat_two;
     use super::crc32;
-    use super::Crc;
 
     /// Known-answer: an empty input hashes to the standard CRC-32 of the empty string.
     #[test]

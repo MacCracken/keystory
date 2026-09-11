@@ -1,10 +1,10 @@
 [package]
 name = "keystory"
 version = "0.1.0"
-edition = "2021"
-# Minimum supported Rust version, verified in CI with `cargo +1.81 check --all-targets`.
-# The `reason = "..."` lint attributes in src/rt.rs are what set the floor.
-rust-version = "1.81"
+edition = "2024"
+# The project targets the latest stable Rust: `rust-version` tracks the toolchain pinned
+# in rust-toolchain.toml rather than an older floor, and the crate is on edition 2024.
+rust-version = "1.98"
 description = "Crash-resilient key/value store engine: fsync'd segmented WAL, atomic checkpoints, RCU snapshot reads, an in-process Raft driver and a hand-rolled cooperative runtime."
 license = "MIT OR Apache-2.0"
 readme = "README.md"

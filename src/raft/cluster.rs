@@ -19,7 +19,11 @@
 //!     peer by calling the peer's append_entries directly. There is no network layer.
 //!   * Elections are deterministic (the election picks the live node with the most
 //!     up-to-date log, tie-broken by lowest id) -- a stand-in for randomised timers.
-//!     The driver, not the clock, drives liveness.
+//!     The driver, not the clock, drives liveness. A leader stays leader until it fails
+//!     or its quorum is lost; an election runs only when there is no live leader.
+//!   * Reads are leader reads: `get`/`scan` first bring every live follower up to the
+//!     leader's log (so a revived node is caught up on its next read or write) and then
+//!     serve the leader's state. Without a live quorum they return `NoLeader`.
 //!
 //! The genuine guarantees that ARE real: no lost updates across failover, no split-brain
 //! commit (a minority cannot commit), and convergence -- every committed write earns a
@@ -64,16 +68,19 @@ impl Inner {
         self.nodes.len() / 2 + 1
     }
 
-    /// Ensure a live leader exists, re-electing on failover. Returns the leader id, or
-    /// [`ClusterError::NoLeader`] when no live majority exists.
+    /// Ensure a leader backed by a whole-cluster quorum, electing one only when there is
+    /// no live leader. Returns [`ClusterError::NoLeader`] when no live majority exists;
+    /// a leader whose quorum is gone steps down rather than proposing into a minority.
     fn ensure_leader(&mut self) -> Result<NodeId, ClusterError> {
-        if self.leader.map_or(true, |l| self.down.contains(&l)) {
+        if self.live().len() < self.quorum() {
             self.leader = None;
+            return Err(ClusterError::NoLeader);
         }
-        match self.elect() {
-            Some(l) => Ok(l),
-            None => Err(ClusterError::NoLeader),
+        if let Some(l) = self.leader.filter(|l| !self.down.contains(l)) {
+            return Ok(l);
         }
+        self.leader = None;
+        self.elect().ok_or(ClusterError::NoLeader)
     }
 
     /// A deterministic election that succeeds *iff* a live node can reach a
@@ -92,7 +99,7 @@ impl Inner {
                 self.nodes[&id].log.last_term(),
                 self.nodes[&id].log.last_index(),
             );
-            if key > best || (key == best && cand.map_or(true, |c| id < c)) {
+            if key > best || (key == best && cand.is_none_or(|c| id < c)) {
                 cand = Some(id);
                 best = key;
             }
@@ -148,7 +155,7 @@ impl Inner {
         self.down.insert(id);
     }
 
-    /// Revive a failed node; it rejoins and the next `put` catches it up.
+    /// Revive a failed node; it rejoins and the next `put` or `get` catches it up.
     pub(super) fn revive(&mut self, id: NodeId) {
         self.down.remove(&id);
     }
@@ -210,18 +217,18 @@ impl RaftCluster {
         self.inner.lock().unwrap().revive(id);
     }
 
-    /// The leader's converged view of `key`. Returns `None` if absent. Panics if any
-    /// live node disagrees -- the convergence invariant the cluster must always hold.
+    /// The leader's view of `key`, after every live follower has been caught up to the
+    /// leader's log: a leader read backed by a converged live set. `None` if absent.
+    /// `Err(NoLeader)` when no live majority exists -- a minority serves nothing, which
+    /// is the split-brain guard. Panics if a live node still disagrees, which would mean
+    /// the replication invariant itself is broken.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, ClusterError> {
-        let g = self.inner.lock().unwrap();
-        let leader = g
-            .leader
-            .filter(|l| !g.down.contains(l))
-            .or_else(|| g.live().into_iter().next())
-            .ok_or(ClusterError::NoLeader)?;
+        let mut g = self.inner.lock().unwrap();
+        let leader = g.ensure_leader()?;
+        sync_live_followers(&mut g, leader);
         let kb = key.as_ref().to_vec();
         let v = g.nodes[&leader].get(&kb);
-        for &id in &g.live() {
+        for id in g.live() {
             assert_eq!(
                 g.nodes[&id].get(&kb).as_deref(),
                 v.as_deref(),
@@ -229,7 +236,7 @@ impl RaftCluster {
             );
         }
         if let Some(m) = self.model.as_ref() {
-            m.record_read(g.nodes[&leader].applied, kb.clone(), v.clone());
+            m.record_read(g.nodes[&leader].applied, kb, v.clone());
         }
         Ok(v)
     }
@@ -255,13 +262,12 @@ impl RaftCluster {
         )
     }
 
-    /// A leader-side prefix scan of the converged state.
+    /// A leader-side prefix scan of the converged state (same quorum and catch-up
+    /// discipline as [`RaftCluster::get`]).
     pub fn scan(&self, prefix: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, ClusterError> {
-        let g = self.inner.lock().unwrap();
-        let leader = g
-            .leader
-            .filter(|l| !g.down.contains(l))
-            .ok_or(ClusterError::NoLeader)?;
+        let mut g = self.inner.lock().unwrap();
+        let leader = g.ensure_leader()?;
+        sync_live_followers(&mut g, leader);
         let pref = prefix.as_ref().to_vec();
         let out = g.nodes[&leader]
             .state
@@ -350,6 +356,21 @@ fn peer_catch_up(g: &mut Inner, leader: NodeId, peer: NodeId, idx: u64, lterm: u
     }
 }
 
+/// Bring every live follower up to the leader's log tip and apply everything committed,
+/// so a read from the leader is backed by a converged live set. This is how a revived
+/// node catches up: on its next read or write, not by a background loop.
+fn sync_live_followers(g: &mut Inner, leader: NodeId) {
+    let tip = g.nodes[&leader].log.last_index();
+    let lterm = g.nodes[&leader].term;
+    for id in g.live() {
+        if id != leader {
+            peer_catch_up(g, leader, id, tip, lterm);
+        }
+    }
+    let ci = g.nodes[&leader].commit_idx;
+    apply_committed(g, ci);
+}
+
 /// Apply the committed suffix `[applied+1 ..= upto]` to every **live** node's state machine,
 /// advancing each node's `commit_idx`/`applied` so the views converge.
 fn apply_committed(g: &mut Inner, upto: u64) {
@@ -418,5 +439,38 @@ mod test {
         c.revive(1); // 2 of 3 => a quorum, so writes resume
         assert!(c.put(vec![b'a'], vec![7]).is_ok());
         assert_eq!(c.get(vec![b'a']).unwrap(), Some(vec![7]));
+    }
+
+    /// Regression (Phase 6): a revived follower that missed writes is caught up by the
+    /// next read, so `get` converges instead of panicking on the stale node.
+    #[test]
+    fn get_after_revive_catches_the_node_up() {
+        let c = RaftCluster::new(3);
+        c.put(b"a", b"1").expect("seed");
+        let leader = c.leader().expect("a leader");
+        let follower = (0..3u64).find(|&id| id != leader).unwrap();
+        c.fail(follower);
+        c.put(b"a", b"2").expect("2 of 3 commit");
+        c.revive(follower);
+        assert_eq!(
+            c.get(b"a").unwrap(),
+            Some(b"2".to_vec()),
+            "revived node caught up"
+        );
+        assert_eq!(c.leader(), Some(leader), "the leader did not change");
+    }
+
+    /// A leader stays leader across writes: no election runs while a live leader exists.
+    #[test]
+    fn leader_is_sticky_across_writes() {
+        let c = RaftCluster::new(3);
+        c.put(b"a", b"1").unwrap();
+        let first = c.leader().unwrap();
+        for i in 0..20u8 {
+            c.put(b"a", [i]).unwrap();
+            assert_eq!(c.leader(), Some(first), "no re-election on write {i}");
+        }
+        let g = c.inner.lock().unwrap();
+        assert_eq!(g.nodes[&first].term, 1, "one election, term stays 1");
     }
 }

@@ -9,7 +9,7 @@
 //! 3. `rename(tmp, "snap.dat")` -- on the same filesystem this is atomic, so a reader
 //!    (including a post-crash recovery) sees the *old* file or the *new* one, never
 //!    a half-written one;
-//! 4. best-effort `fsync` of the directory so the rename itself is durable.
+//! 4. `fsync` the directory so the rename itself is durable.
 //!
 //! ## On-disk format (little-endian, no external dependency)
 //!
@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::crc::{crc32, Crc};
+use crate::crc::{Crc, crc32};
 use crate::types::{Entry, Snapshot};
 
 /// Magic prefix + format version. A mismatch is a corrupt/foreign file.
@@ -101,12 +101,9 @@ pub fn write(dir: impl AsRef<Path>, snap: &Snapshot) -> io::Result<()> {
     drop(out); // close before the rename so later metadata queries observe the flushed size
 
     std::fs::rename(&tmp, &final_path).map_err(|e| io::Error::other(format!("rename: {e}")))?;
-    // Best-effort fsync of the directory entry (the rename itself). Not every
-    // platform guarantees this; a crash after the rename still leaves the old
-    // file, which is safe.
-    if let Ok(dt) = std::fs::File::open(dir) {
-        dt.sync_all().ok();
-    }
+    // Make the rename itself durable: POSIX promises nothing about a directory entry
+    // until the directory is synced. (A no-op off Unix.)
+    crate::wal::fsync_dir(dir)?;
     Ok(())
 }
 

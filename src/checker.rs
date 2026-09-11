@@ -48,8 +48,9 @@ pub struct ReadRec {
 ///
 /// `writes` is per-key, sorted ascending by commit index. `reads` is the flattened log
 /// of every observation. Both are `Mutex`-guarded so a multi-threaded workload can feed
-/// the model concurrently; per-key write lists stay ordered because a key has a single
-/// writer that commits in increasing-index order.
+/// the model concurrently. Writers record *after* their commit returns, outside the
+/// engine's lock, so interleaved writers on one key may record out of order; `check`
+/// sorts each key's log by commit index before validating anything.
 /// One write entry: its commit index and the value it left visible.
 type IndexedWrite = (u64, Stored);
 
@@ -107,8 +108,13 @@ pub trait CheckModel {
 
 impl CheckModel for Model {
     fn check(&self) -> CheckResult {
-        let writes = self.writes.lock().expect("writes mutex poisoned");
+        let mut writes = self.writes.lock().expect("writes mutex poisoned");
         let reads = self.reads.lock().expect("reads mutex poisoned");
+        // Per-key logs may have been appended out of index order (see the type docs);
+        // sort them once, then every expectation is a binary search.
+        for log in writes.values_mut() {
+            log.sort_by_key(|(index, _)| *index);
+        }
         let mut result = CheckResult {
             violations: Vec::new(),
             checked: reads.len(),
@@ -116,16 +122,13 @@ impl CheckModel for Model {
         for r in reads.iter() {
             // Expected = value of the latest write to this key at index <= read_index,
             // or None if the latest such write was a delete / none has happened.
-            let expected =
-                match writes.get(&r.key) {
-                    None => None,
-                    Some(log) => log.iter().rev().find(|(i, _)| *i <= r.read_index).and_then(
-                        |(_, stored)| match stored {
-                            Stored::Present(v) => Some(v.clone()),
-                            Stored::Deleted => None,
-                        },
-                    ),
-                };
+            let expected = writes.get(&r.key).and_then(|log| {
+                let n = log.partition_point(|(index, _)| *index <= r.read_index);
+                match log[..n].last() {
+                    Some((_, Stored::Present(v))) => Some(v.clone()),
+                    _ => None,
+                }
+            });
             if r.value != expected {
                 result.violations.push((r.clone(), expected));
             }
@@ -187,5 +190,21 @@ mod tests {
         m.record_read(2, b"k", None); // absent at index 2
         m.record_read(3, b"k", None); // still absent (no newer write)
         assert!(m.check().violations.is_empty());
+    }
+
+    /// Writers that record out of index order (a later commit recorded first) must not
+    /// confuse the expectation: the log is sorted before checking.
+    #[test]
+    fn out_of_order_recording_is_sorted_before_checking() {
+        let m = Model::new();
+        m.record_write(2, b"k", Some(b"v2".to_vec()));
+        m.record_write(1, b"k", Some(b"v1".to_vec()));
+        m.record_write(3, b"k", None);
+        m.record_read(1, b"k", Some(b"v1".to_vec()));
+        m.record_read(2, b"k", Some(b"v2".to_vec()));
+        m.record_read(3, b"k", None);
+        assert!(m.check().violations.is_empty());
+        m.record_read(2, b"k", Some(b"v1".to_vec())); // stale value at index 2: wrong
+        assert_eq!(m.check().violations.len(), 1);
     }
 }

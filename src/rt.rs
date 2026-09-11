@@ -219,9 +219,9 @@ pub fn yield_once() -> YieldOnce {
 
 #[cfg(test)]
 mod test {
-    use super::{yield_once, Scheduler};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use super::{Scheduler, yield_once};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A future that just resolves is driven to completion.
     #[test]

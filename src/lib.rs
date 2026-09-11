@@ -15,7 +15,7 @@
 //! | [`types`] | `Op`, `Entry`, `Snapshot`: the deterministic, index-ordered state model. |
 //! | [`checker`] | Offline MVCC sequential-consistency oracle used by the Jepsen-lite tests. |
 //! | [`raft`] | Pure Raft FSM, an in-process synchronous cluster driver, and an `async fn` facade. |
-//! | [`btree_store`] | Ordered B+ tree with a CRC-guarded document format (used as a secondary range index). |
+//! | [`btree_store`] | Ordered B+ tree with a CRC-guarded document format; standalone, not used by `Store`. |
 //! | [`valuestore`] | Off-heap blob log for large values: a tested primitive, not yet wired into `Store`. |
 //! | [`epoch_rcu`] | Epoch-based reclamation model; not the hot path (see its docs). |
 //! | [`rt`] | Single-threaded cooperative async runtime with hand-built wakers. |
