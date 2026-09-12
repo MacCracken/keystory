@@ -8,17 +8,27 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::Arc;
 
-/// Bytes are the canonical key/value representation. `String` keys accepted by the
-/// public API are coerced to `Bytes`.
+/// Owned bytes: the key/value representation at the API boundary and inside [`Op`].
+/// `String` keys accepted by the public API are coerced to `Bytes`.
 pub type Bytes = Vec<u8>;
+
+/// Immutable, reference-counted bytes: the representation inside a [`Snapshot`].
+/// Every commit clones the snapshot's map; with shared keys and values that clone bumps
+/// reference counts instead of copying every byte, so its cost is proportional to the
+/// number of entries, not to the size of the data.
+pub type Shared = Arc<[u8]>;
+
+/// The materialised state: live keys to their entries, in byte order.
+pub type Map = BTreeMap<Shared, Entry>;
 
 /// A stored entry. `version` is the commit index at which this entry's state was
 /// written: the per-key logical clock that a historical `get_at(index)` read would
 /// traverse (not implemented yet).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
-    pub value: Bytes,
+    pub value: Shared,
     pub version: u64,
 }
 
@@ -36,25 +46,27 @@ impl Op {
     ///   * `Put` to a new key, or to a key whose current value differs, changes state.
     ///   * `Put` to a key with the identical value is a no-op (idempotence).
     ///   * `Delete` of a present key changes state; of an absent key does not.
-    pub fn apply(&self, map: &mut BTreeMap<Bytes, Entry>, index: u64) -> bool {
+    pub fn apply(&self, map: &mut Map, index: u64) -> bool {
         match self {
             Op::Put { key, value } => {
-                let changed = match map.get(key) {
-                    Some(e) => e.value != *value,
-                    None => true,
-                };
-                if changed {
+                if let Some(e) = map.get_mut(key.as_slice()) {
+                    if &*e.value == value.as_slice() {
+                        return false; // A same-value put is a true no-op: state and version unchanged.
+                    }
+                    e.value = Shared::from(value.as_slice());
+                    e.version = index;
+                } else {
                     map.insert(
-                        key.clone(),
+                        Shared::from(key.as_slice()),
                         Entry {
-                            value: value.clone(),
+                            value: Shared::from(value.as_slice()),
                             version: index,
                         },
                     );
-                } // A same-value put is a true no-op: state and version unchanged.
-                changed
+                }
+                true
             }
-            Op::Delete { key } => map.remove(key).is_some(),
+            Op::Delete { key } => map.remove(key.as_slice()).is_some(),
         }
     }
 }
@@ -69,7 +81,7 @@ pub struct Snapshot {
     /// Commit index of the last operation reflected in this snapshot.
     pub index: u64,
     /// Materialised key/state map (live entries only; deletes reflected by absence).
-    pub data: BTreeMap<Bytes, Entry>,
+    pub data: Map,
 }
 
 impl Snapshot {
@@ -87,25 +99,25 @@ impl Snapshot {
     }
 
     /// Snapshot-consistent prefix scan: every live key with the given prefix, in
-    /// byte order. The returned `Vec` is stable for the lifetime of the snapshot
-    /// that produced it; no later write can reach into it.
-    pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Entry)> {
+    /// byte order. The returned entries are reference-counted views into this
+    /// snapshot; no later write can reach into them.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Shared, Entry)> {
         self.data
             .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
             .take_while(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (Arc::clone(k), v.clone()))
             .collect()
     }
 
     /// Snapshot-consistent ordered range `[lo, hi)`: `lo` inclusive, `hi` exclusive,
     /// empty when `lo >= hi`. O(log n + k) on the underlying ordered map.
-    pub fn range(&self, lo: &[u8], hi: &[u8]) -> Vec<(Vec<u8>, Entry)> {
+    pub fn range(&self, lo: &[u8], hi: &[u8]) -> Vec<(Shared, Entry)> {
         if lo >= hi {
             return Vec::new();
         }
         self.data
             .range::<[u8], _>((Bound::Included(lo), Bound::Excluded(hi)))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (Arc::clone(k), v.clone()))
             .collect()
     }
 
@@ -124,40 +136,28 @@ impl Snapshot {
 mod tests {
     use super::*;
 
+    fn put(k: &[u8], v: &[u8]) -> Op {
+        Op::Put {
+            key: k.to_vec(),
+            value: v.to_vec(),
+        }
+    }
+
     #[test]
     fn put_overwrite_changes_state() {
-        let mut m: BTreeMap<_, _> = BTreeMap::new();
-        Op::Put {
-            key: b"k".to_vec(),
-            value: b"a".to_vec(),
-        }
-        .apply(&mut m, 1);
-        assert!(
-            Op::Put {
-                key: b"k".to_vec(),
-                value: b"b".to_vec()
-            }
-            .apply(&mut m, 2)
-        );
-        assert_eq!(m.get(b"k".as_slice()).unwrap().value, b"b".to_vec());
-        assert_eq!(m.get(b"k".as_slice()).unwrap().version, 2);
+        let mut m = Map::new();
+        put(b"k", b"a").apply(&mut m, 1);
+        assert!(put(b"k", b"b").apply(&mut m, 2));
+        let e = m.get(b"k".as_slice()).unwrap();
+        assert_eq!(&*e.value, b"b");
+        assert_eq!(e.version, 2);
     }
 
     #[test]
     fn idempotent_put_same_value_is_noop() {
-        let mut m: BTreeMap<_, _> = BTreeMap::new();
-        Op::Put {
-            key: b"k".to_vec(),
-            value: b"a".to_vec(),
-        }
-        .apply(&mut m, 1);
-        assert!(
-            !Op::Put {
-                key: b"k".to_vec(),
-                value: b"a".to_vec()
-            }
-            .apply(&mut m, 2)
-        );
+        let mut m = Map::new();
+        put(b"k", b"a").apply(&mut m, 1);
+        assert!(!put(b"k", b"a").apply(&mut m, 2));
         assert_eq!(
             m.get(b"k".as_slice()).unwrap().version,
             1,
@@ -167,46 +167,49 @@ mod tests {
 
     #[test]
     fn delete_missing_is_noop() {
-        let mut m: BTreeMap<_, _> = BTreeMap::new();
+        let mut m = Map::new();
         assert!(!Op::Delete { key: b"k".to_vec() }.apply(&mut m, 1));
-        Op::Put {
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-        }
-        .apply(&mut m, 1);
+        put(b"k", b"v").apply(&mut m, 1);
         assert!(Op::Delete { key: b"k".to_vec() }.apply(&mut m, 2));
         assert!(!Op::Delete { key: b"k".to_vec() }.apply(&mut m, 3));
         assert!(m.is_empty());
+    }
+
+    /// Cloning a map shares its keys and values instead of copying them: the substance of
+    /// the Phase 6 per-commit cost fix.
+    #[test]
+    fn cloned_maps_share_bytes() {
+        let mut s = Snapshot::empty();
+        put(b"k", b"a-fairly-long-value").apply(&mut s.data, 1);
+        let copy = s.data.clone();
+        let (k1, e1) = s.data.iter().next().unwrap();
+        let (k2, e2) = copy.iter().next().unwrap();
+        assert!(Arc::ptr_eq(k1, k2), "keys are shared");
+        assert!(Arc::ptr_eq(&e1.value, &e2.value), "values are shared");
     }
 
     #[test]
     fn scan_prefix_is_ordered() {
         let mut s = Snapshot::empty();
         for k in [b"ab", b"aa", b"ba", b"ac"] {
-            Op::Put {
-                key: k.to_vec(),
-                value: k.to_vec(),
-            }
-            .apply(&mut s.data, 1);
+            put(k, k).apply(&mut s.data, 1);
         }
-        let got = s.scan_prefix(b"a");
-        assert_eq!(
-            got.iter().map(|(k, _)| &**k).collect::<Vec<_>>(),
-            [b"aa", b"ab", b"ac"]
-        );
+        let got: Vec<Vec<u8>> = s
+            .scan_prefix(b"a")
+            .into_iter()
+            .map(|(k, _)| k.to_vec())
+            .collect();
+        assert_eq!(got, [b"aa".to_vec(), b"ab".to_vec(), b"ac".to_vec()]);
     }
 
     #[test]
     fn range_is_half_open_and_ordered() {
         let mut s = Snapshot::empty();
         for k in [b"d", b"b", b"a", b"c"] {
-            Op::Put {
-                key: k.to_vec(),
-                value: k.to_vec(),
-            }
-            .apply(&mut s.data, 1);
+            put(k, k).apply(&mut s.data, 1);
         }
-        let keys = |v: Vec<(Vec<u8>, Entry)>| v.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        let keys =
+            |v: Vec<(Shared, Entry)>| v.into_iter().map(|(k, _)| k.to_vec()).collect::<Vec<_>>();
         assert_eq!(
             keys(s.range(b"b", b"d")),
             vec![b"b".to_vec(), b"c".to_vec()]

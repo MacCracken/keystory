@@ -21,12 +21,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::types::{Entry, Op};
+use crate::types::Op;
 
 /// Node identifiers.
 pub type NodeId = u64;
-/// The state-machine key/value type: identical to the Phase-1 engine's map.
-pub type Map = BTreeMap<Vec<u8>, Entry>;
+/// The state-machine key/value type: identical to the single-node engine's map.
+pub type Map = crate::types::Map;
 /// A command in the replicated log. Reuses the idempotent Phase-1 op.
 pub type Cmd = Op;
 
@@ -224,8 +224,11 @@ impl Node {
         if sender_term < self.term {
             return false;
         }
-        // Must not have voted already in this term.
-        if self.voted_for.is_some() {
+        // One vote per term: a vote already granted to someone else is final. The same
+        // candidate asking again (a retried request) is answered the same way.
+        if let Some(v) = self.voted_for
+            && v != from
+        {
             return false;
         }
         // Eligibility: the candidate's log is at least as up-to-date as ours.
@@ -239,8 +242,14 @@ impl Node {
         true
     }
 
-    /// Handle an `AppendEntries` from leader `from`. Returns the index the leader should
-    /// resume from on a (contiguity-)mismatch, else `None` (everything accepted).
+    /// Handle an `AppendEntries` from leader `from`. Returns `None` when the append was
+    /// accepted, or `Some(resume_from)`: the index the leader should send from next,
+    /// after this follower dropped a divergent (uncommitted) tail.
+    ///
+    /// Entries already held with the same term are skipped, so a redelivered message is
+    /// idempotent; the first entry whose term differs from ours at that index replaces
+    /// it and everything after (Raft §5.3). `voted_for` survives an append in the same
+    /// term: the vote belongs to the term, not to the message.
     ///
     /// Updates `commit_idx` up to `leader_commit` (but never past a locally-known entry) --
     /// the mechanism by which a commit "propagates" to followers.
@@ -257,9 +266,12 @@ impl Node {
         if leader_term < self.term {
             return Some(self.log.last_index() + 1);
         }
-        self.term = leader_term;
+        if leader_term > self.term {
+            // A newer term: adopt it. The old vote belonged to the old term.
+            self.term = leader_term;
+            self.voted_for = None;
+        }
         self.role = Role::Follower;
-        self.voted_for = None;
         self.leader_id = Some(from); // record the leader we follow.
 
         // 1) Consistency check on the entry preceding the append (index 0 => empty prefix).
@@ -269,23 +281,30 @@ impl Node {
             self.log.term_of(prev_index) == Some(prev_term)
         };
         if !prev_ok {
-            // Find the largest probe < prev_index whose term matches, then truncate up to
-            // it and ask the leader to resume from that point.
-            let mut probe = prev_index;
-            while probe > 0 && self.log.term_of(probe) != Some(prev_term) {
-                probe -= 1;
+            // The entry at `prev_index` is missing or from another term. If it is present
+            // it is an uncommitted divergence (a committed entry can never disagree with a
+            // legitimate leader), so drop it and everything after it, and ask the leader to
+            // resume right after what we still hold.
+            if self.log.term_of(prev_index).is_some() {
+                self.log.truncate_from(prev_index);
             }
-            if probe > 0 {
-                self.log.truncate_from(probe);
-            } else {
-                self.log.truncate_from(1); // matched nothing; clear the log entirely.
-            }
-            return Some(self.log.last_index());
+            return Some(self.log.last_index() + 1);
         }
 
-        // 2) Append the new entries.
-        for e in entries {
-            self.log.append(std::slice::from_ref(e));
+        // 2) Append. Skip entries we already hold identically; the first entry whose term
+        //    differs from ours at that index replaces it and everything after.
+        for (i, e) in entries.iter().enumerate() {
+            let next = prev_index + 1 + i as u64;
+            match self.log.term_of(next) {
+                Some(t) if t == e.self_term => {} // already replicated
+                Some(_) => {
+                    self.log.truncate_from(next);
+                    self.log.append(std::slice::from_ref(e));
+                }
+                None => {
+                    self.log.append(std::slice::from_ref(e));
+                }
+            }
         }
 
         // 3) Commit up to the leader's commit, but never past what we actually hold.
@@ -354,7 +373,7 @@ impl Node {
 
     /// A point read of the state machine (reflects everything applied up to `applied`).
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.state.get(key).map(|e| e.value.clone())
+        self.state.get(key).map(|e| e.value.to_vec())
     }
 
     /// Number of live keys in the state machine.
@@ -445,8 +464,8 @@ mod tests {
         let reply = follower.append_entries(0, 2, 1, 9, &[], 0);
         assert_eq!(
             reply,
-            Some(0),
-            "mismatch => leader should resume from index 0"
+            Some(1),
+            "mismatch => the divergent entry is dropped and the leader resumes from index 1"
         );
         assert_eq!(
             follower.log.last_index(),
@@ -538,5 +557,72 @@ mod tests {
         assert_eq!(fresh.get(b"a"), Some(b"1".to_vec()));
         assert_eq!(fresh.get(b"b"), Some(b"2".to_vec()));
         assert_eq!(fresh.applied, ns[1].commit_idx);
+    }
+
+    /// Regression (Phase 6): a redelivered `AppendEntries` must not append its entries a
+    /// second time.
+    #[test]
+    fn duplicate_append_is_idempotent() {
+        let mut f = Node::new(1, BTreeSet::from([0u64, 1, 2]));
+        let es = [
+            LogEntry::new(1, Op::Delete { key: b"a".to_vec() }),
+            LogEntry::new(1, Op::Delete { key: b"b".to_vec() }),
+        ];
+        assert!(f.append_entries(0, 1, 0, 0, &es, 0).is_none());
+        assert!(
+            f.append_entries(0, 1, 0, 0, &es, 0).is_none(),
+            "redelivery is accepted"
+        );
+        assert_eq!(
+            f.log.last_index(),
+            2,
+            "redelivered entries are not appended twice"
+        );
+    }
+
+    /// An entry that conflicts (same index, different term) replaces the follower's
+    /// entry and everything after it, rather than being appended past the old tail.
+    #[test]
+    fn conflicting_entry_is_replaced_not_appended() {
+        let mut f = Node::new(1, BTreeSet::from([0u64, 1, 2]));
+        // The follower holds [t1@1, t1@2] from an old leader.
+        f.log.append(&[
+            LogEntry::new(1, Op::Delete { key: b"x".to_vec() }),
+            LogEntry::new(1, Op::Delete { key: b"y".to_vec() }),
+        ]);
+        // A term-2 leader agrees on index 1 but carries different entries from index 2 on.
+        let es = [
+            LogEntry::new(2, Op::Delete { key: b"p".to_vec() }),
+            LogEntry::new(2, Op::Delete { key: b"q".to_vec() }),
+        ];
+        assert!(f.append_entries(0, 2, 1, 1, &es, 0).is_none());
+        assert_eq!(f.log.last_index(), 3, "index 2 replaced, index 3 appended");
+        assert_eq!(f.log.term_of(1), Some(1));
+        assert_eq!(f.log.term_of(2), Some(2));
+        assert_eq!(f.log.get(2).unwrap().cmd, Op::Delete { key: b"p".to_vec() });
+        assert_eq!(f.log.get(3).unwrap().cmd, Op::Delete { key: b"q".to_vec() });
+    }
+
+    /// A heartbeat in the same term must not reset `votedFor`, or a node could vote twice
+    /// in one term; a retried request from the same candidate is still granted.
+    #[test]
+    fn heartbeat_does_not_reset_the_vote() {
+        let mut ns = nodes(3);
+        ns[2].start_election(); // term 1
+        assert!(ns[1].request_vote(2, 1, 0, 0));
+        assert!(ns[1].append_entries(2, 1, 0, 0, &[], 0).is_none());
+        assert_eq!(
+            ns[1].voted_for,
+            Some(2),
+            "the vote for this term persists across heartbeats"
+        );
+        assert!(
+            !ns[1].request_vote(0, 1, 0, 0),
+            "no second vote in the same term"
+        );
+        assert!(
+            ns[1].request_vote(2, 1, 0, 0),
+            "a repeated request from the same candidate is granted again"
+        );
     }
 }

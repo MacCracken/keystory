@@ -271,9 +271,12 @@ impl RaftCluster {
         let pref = prefix.as_ref().to_vec();
         let out = g.nodes[&leader]
             .state
-            .range(pref.clone()..)
+            .range::<[u8], _>((
+                std::ops::Bound::Included(pref.as_slice()),
+                std::ops::Bound::Unbounded,
+            ))
             .take_while(|(k, _)| k.starts_with(&pref))
-            .map(|(k, e)| (k.clone(), e.value.clone()))
+            .map(|(k, e)| (k.to_vec(), e.value.to_vec()))
             .collect();
         Ok(out)
     }
@@ -325,10 +328,10 @@ pub(crate) fn cluster_commit(cluster: &RaftCluster, op: Op) -> Result<u64, Clust
     Ok(ci)
 }
 
-/// Push a peer's log up to `idx` (the leader's tip) via `AppendEntries`. In this driver
-/// every peer's log is a *prefix* of the leader's (the last entry always committed to a
-/// quorum, and a new leader is always the most-up-to-date live node), so the suffix always
-/// applies cleanly. Returns whether the peer reached `idx`.
+/// Push a peer's log up to `idx` (the leader's tip) via `AppendEntries`, resending from
+/// wherever the follower says it still agrees after it drops a divergent tail. Returns
+/// whether the peer reached `idx`; `false` only if the follower rejects without making
+/// progress, which means it is ahead of this leader (a stale leader).
 fn peer_catch_up(g: &mut Inner, leader: NodeId, peer: NodeId, idx: u64, lterm: u64) -> bool {
     loop {
         let start = g.nodes[&peer].log.last_index() + 1;
@@ -341,6 +344,7 @@ fn peer_catch_up(g: &mut Inner, leader: NodeId, peer: NodeId, idx: u64, lterm: u
         let suffix: Vec<_> = (start..=idx)
             .filter_map(|i| g.nodes[&leader].log.get(i).cloned())
             .collect();
+        let before = g.nodes[&peer].log.last_index();
         let res = g.nodes.get_mut(&peer).unwrap().append_entries(
             leader,
             lterm,
@@ -349,10 +353,11 @@ fn peer_catch_up(g: &mut Inner, leader: NodeId, peer: NodeId, idx: u64, lterm: u
             &suffix,
             leader_commit,
         );
-        // `None` = accepted (a prefix peer). A `Some` mismatch cannot arise from a prefix
-        // peer here, but if it did the follower already truncated the divergent tail, so
-        // the next loop iteration resyncs from the corrected prefix.
-        let _ = res;
+        if res.is_some() && g.nodes[&peer].log.last_index() == before {
+            return false; // rejected without truncating anything: the follower is ahead.
+        }
+        // Accepted, or the follower truncated a divergent tail; the next iteration
+        // resends from its corrected tip.
     }
 }
 

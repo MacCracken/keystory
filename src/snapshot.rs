@@ -2,14 +2,23 @@
 //!
 //! A checkpoint materialises the entire live state into a single self-contained
 //! file so recovery can start from a fast point instead of replaying the whole WAL.
-//! The write protocol is the classic atomic-publish pattern:
+//! The write protocol is the classic atomic-publish pattern, with one generation of
+//! history kept:
 //!
 //! 1. stream the body to a temporary sibling file `snap.tmp`, folding the CRC as it goes;
 //! 2. `fsync` the tmp file (durability of bytes on the storage medium);
-//! 3. `rename(tmp, "snap.dat")` -- on the same filesystem this is atomic, so a reader
+//! 3. `rename("snap.dat", "snap.prev")` -- the previous checkpoint is retained;
+//! 4. `rename(tmp, "snap.dat")` -- on the same filesystem this is atomic, so a reader
 //!    (including a post-crash recovery) sees the *old* file or the *new* one, never
 //!    a half-written one;
-//! 4. `fsync` the directory so the rename itself is durable.
+//! 5. `fsync` the directory so the renames themselves are durable.
+//!
+//! [`load`] prefers `snap.dat` and falls back to `snap.prev` when the latest file is
+//! missing (a crash between steps 3 and 4) or fails its CRC. The engine keeps every
+//! WAL segment newer than `snap.prev` until the *next* checkpoint (see
+//! `Store::checkpoint`), so a fall-back plus WAL replay still reconstructs the full
+//! state. A corrupt `snap.dat` with no usable `snap.prev` is an error, never an
+//! empty store.
 //!
 //! ## On-disk format (little-endian, no external dependency)
 //!
@@ -30,57 +39,80 @@
 //! wall-clock time, matching the crate-wide principle that only the logical commit
 //! index orders events.
 //!
-//! ## Known limits (tracked in `ROADMAP.md`)
-//! A checkpoint is a whole-map rewrite, O(N) in the live state, and only the latest
-//! generation is kept: a corrupt `snap.dat` makes [`load`] fail rather than fall back
-//! to an older checkpoint.
+//! ## Known limit (tracked in `ROADMAP.md`)
+//! A checkpoint is a whole-map rewrite, O(N) in the live state.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::crc::{Crc, crc32};
-use crate::types::{Entry, Snapshot};
+use crate::types::{Entry, Shared, Snapshot};
 
 /// Magic prefix + format version. A mismatch is a corrupt/foreign file.
 const MAGIC: &[u8] = b"KSN1";
 const FORMAT: u32 = 1;
 
-/// The on-disk name of a durable checkpoint within a store directory.
+/// The on-disk name of the latest durable checkpoint within a store directory.
 pub const SNAPSHOT_NAME: &str = "snap.dat";
+/// The previous checkpoint, kept as a fall-back until the next one replaces it.
+pub const SNAPSHOT_PREV: &str = "snap.prev";
 /// The transient name written-then-renamed into place.
 pub const SNAPSHOT_TMP: &str = "snap.tmp";
 
-/// Load a checkpoint from `dir` if one exists.
+/// Load the most recent usable checkpoint from `dir`, if any.
 ///
-/// `Ok(None)` means no snapshot file is present (first-ever start). `Ok(Some(_))`
-/// means a well-formed, CRC-valid snapshot. A genuine `io::Error` is returned only
-/// for I/O failures; a truncated/corrupt *body* is reported as `InvalidData`. A torn
-/// checkpoint must never be applied -- unlike a WAL tail, we cannot tell which of its
-/// bytes are complete -- so the caller ([`crate::Store::open`]) fails rather than
-/// guessing.
+/// `Ok(None)` means no checkpoint exists at all (first-ever start). `Ok(Some(_))` is a
+/// well-formed, CRC-valid snapshot: `snap.dat` when it is intact, else `snap.prev`. A
+/// torn checkpoint is never applied -- unlike a WAL tail, we cannot tell which of its
+/// bytes are complete -- so a corrupt `snap.dat` with no usable `snap.prev` is an
+/// `InvalidData` error, and the caller ([`crate::Store::open`]) fails rather than
+/// silently starting empty. Genuine I/O failures are returned as they are.
 pub fn load(dir: impl AsRef<Path>) -> io::Result<Option<Snapshot>> {
-    let path = dir.as_ref().join(SNAPSHOT_NAME);
+    let dir = dir.as_ref();
+    match load_file(&dir.join(SNAPSHOT_NAME)) {
+        Ok(Some(s)) => Ok(Some(s)),
+        // No latest file: either a fresh store (no previous either) or a crash between
+        // the two renames, which leaves only the previous generation.
+        Ok(None) => load_file(&dir.join(SNAPSHOT_PREV)),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            match load_file(&dir.join(SNAPSHOT_PREV))? {
+                Some(prev) => Ok(Some(prev)),
+                None => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Load and verify one checkpoint file; `Ok(None)` if it does not exist.
+fn load_file(path: &Path) -> io::Result<Option<Snapshot>> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path)?;
-    let snap =
-        decode(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let bytes = std::fs::read(path)?;
+    let snap = decode(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {e}", path.display()),
+        )
+    })?;
     Ok(Some(snap))
 }
 
-/// Write a checkpoint of `snap` to `dir` durably (tmp + fsync + atomic rename).
+/// Write a checkpoint of `snap` to `dir` durably (tmp + fsync + atomic rename), keeping
+/// the previous `snap.dat` as `snap.prev`.
 ///
 /// The body is streamed record by record with the CRC folded incrementally, so peak
 /// allocation is O(one record), not O(whole snapshot). The whole body is fsynced
-/// *before* the rename; the rename is atomic, so a crash anywhere on this path leaves
-/// either the previous `snap.dat` or the new one, never a half-written file. A leftover
+/// *before* the renames; each rename is atomic, so a crash anywhere on this path leaves
+/// a complete previous or new checkpoint, never a half-written file. A leftover
 /// `snap.tmp` from a prior crash is harmless.
 pub fn write(dir: impl AsRef<Path>, snap: &Snapshot) -> io::Result<()> {
     let dir = dir.as_ref();
     let tmp = dir.join(SNAPSHOT_TMP);
-    let final_path = dir.join(SNAPSHOT_NAME);
+    let latest = dir.join(SNAPSHOT_NAME);
+    let prev = dir.join(SNAPSHOT_PREV);
 
     let f = std::fs::OpenOptions::new()
         .write(true)
@@ -100,8 +132,13 @@ pub fn write(dir: impl AsRef<Path>, snap: &Snapshot) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("fsync tmp: {e}")))?;
     drop(out); // close before the rename so later metadata queries observe the flushed size
 
-    std::fs::rename(&tmp, &final_path).map_err(|e| io::Error::other(format!("rename: {e}")))?;
-    // Make the rename itself durable: POSIX promises nothing about a directory entry
+    // Retain the previous generation, then publish the new one.
+    if latest.exists() {
+        std::fs::rename(&latest, &prev)
+            .map_err(|e| io::Error::other(format!("rename to prev: {e}")))?;
+    }
+    std::fs::rename(&tmp, &latest).map_err(|e| io::Error::other(format!("rename: {e}")))?;
+    // Make the renames themselves durable: POSIX promises nothing about a directory entry
     // until the directory is synced. (A no-op off Unix.)
     crate::wal::fsync_dir(dir)?;
     Ok(())
@@ -171,7 +208,7 @@ pub fn decode(bytes: &[u8]) -> Result<Snapshot, Box<dyn std::error::Error + Send
     }
 
     let mut pos = 24usize;
-    let mut data: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+    let mut data: BTreeMap<Shared, Entry> = BTreeMap::new();
     for _ in 0..count {
         if pos + 4 > body.len() {
             return Err("corrupt entry: short key length".into());
@@ -181,7 +218,7 @@ pub fn decode(bytes: &[u8]) -> Result<Snapshot, Box<dyn std::error::Error + Send
         if pos + klen > body.len() {
             return Err("corrupt entry: short key body".into());
         }
-        let key = body[pos..pos + klen].to_vec();
+        let key = Shared::from(&body[pos..pos + klen]);
         pos += klen;
         if pos + 4 > body.len() {
             return Err("corrupt entry: short value length".into());
@@ -191,7 +228,7 @@ pub fn decode(bytes: &[u8]) -> Result<Snapshot, Box<dyn std::error::Error + Send
         if pos + vlen > body.len() {
             return Err("corrupt entry: short value body".into());
         }
-        let value = body[pos..pos + vlen].to_vec();
+        let value = Shared::from(&body[pos..pos + vlen]);
         pos += vlen;
         if pos + 8 > body.len() {
             return Err("corrupt entry: short version".into());
@@ -204,14 +241,15 @@ pub fn decode(bytes: &[u8]) -> Result<Snapshot, Box<dyn std::error::Error + Send
     Ok(Snapshot { index, data })
 }
 
-/// Full path to the checkpoint within `dir` (for tests / diagnostics).
+/// Full path to the latest checkpoint within `dir` (for tests / diagnostics).
 pub fn snapshot_path(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join(SNAPSHOT_NAME)
 }
 
-/// Remove any checkpoint and transient file (used by tests).
+/// Remove every checkpoint file, including the retained previous generation and any
+/// transient file (used by tests).
 pub fn purge(dir: impl AsRef<Path>) -> io::Result<()> {
-    for n in [SNAPSHOT_NAME, SNAPSHOT_TMP] {
+    for n in [SNAPSHOT_NAME, SNAPSHOT_PREV, SNAPSHOT_TMP] {
         let p = dir.as_ref().join(n);
         if p.exists() {
             let _ = std::fs::remove_file(&p);
@@ -223,6 +261,7 @@ pub fn purge(dir: impl AsRef<Path>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Op;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // A fresh, unique temp dir per call. We avoid std::fs::TempDir (its place in
@@ -238,15 +277,19 @@ mod tests {
 
     fn fill(snap: &mut Snapshot, n: usize) {
         for i in 0..n {
-            let k = format!("k{i:04}").into_bytes();
-            snap.data.insert(
-                k,
-                Entry {
-                    value: format!("v{i:04}").into_bytes(),
-                    version: i as u64 + 1,
-                },
-            );
+            Op::Put {
+                key: format!("k{i:04}").into_bytes(),
+                value: format!("v{i:04}").into_bytes(),
+            }
+            .apply(&mut snap.data, i as u64 + 1);
         }
+    }
+
+    fn corrupt(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(path, &bytes).unwrap();
     }
 
     #[test]
@@ -288,12 +331,9 @@ mod tests {
         s.index = 9;
         write(&d, &s).unwrap();
         // Flip a byte in the middle of the file to invalidate the trailing CRC.
-        let p = snapshot_path(&d);
-        let mut bytes = std::fs::read(&p).unwrap();
-        let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xFF;
-        std::fs::write(&p, &bytes).unwrap();
-        assert!(load(&d).is_err(), "corrupt checkpoint must be rejected");
+        corrupt(&snapshot_path(&d));
+        let err = load(&d).expect_err("corrupt checkpoint must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -308,6 +348,53 @@ mod tests {
         assert!(!d.join(SNAPSHOT_TMP).exists());
         std::fs::remove_dir_all(&d).ok();
     }
+
+    /// The previous generation is retained, and is used when the latest is corrupt or
+    /// missing; a corrupt latest with no previous is still an error.
+    #[test]
+    fn previous_generation_is_kept_and_used_as_fallback() {
+        let d = tmp();
+        let mut first = Snapshot::empty();
+        fill(&mut first, 5);
+        first.index = 5;
+        write(&d, &first).unwrap();
+        assert!(!d.join(SNAPSHOT_PREV).exists(), "nothing to retain yet");
+
+        let mut second = first.clone();
+        fill(&mut second, 8);
+        second.index = 8;
+        write(&d, &second).unwrap();
+        assert!(
+            d.join(SNAPSHOT_PREV).exists(),
+            "the first checkpoint was retained"
+        );
+        assert_eq!(
+            load(&d).unwrap().unwrap().index,
+            8,
+            "latest wins when intact"
+        );
+
+        corrupt(&snapshot_path(&d));
+        let got = load(&d)
+            .unwrap()
+            .expect("fell back to the previous generation");
+        assert_eq!(got, first);
+
+        std::fs::remove_file(snapshot_path(&d)).unwrap();
+        assert_eq!(
+            load(&d).unwrap().unwrap(),
+            first,
+            "a missing latest (crash between renames) also falls back"
+        );
+
+        corrupt(&d.join(SNAPSHOT_PREV));
+        assert!(
+            load(&d).is_err(),
+            "no usable generation left: an error, not an empty store"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     /// A large snapshot streamed through the writer decodes back to the identical map,
     /// proving the incremental CRC and per-record layout are consistent at scale.
     #[test]
@@ -323,5 +410,6 @@ mod tests {
         assert_eq!(got.index, 50_000, "index survives a streamed checkpoint");
         assert_eq!(got.data.len(), 50_000, "all entries survive");
         assert_eq!(s.data, got.data, "streamed decode == in-memory state");
+        std::fs::remove_dir_all(&d).ok();
     }
 }

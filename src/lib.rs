@@ -1,25 +1,25 @@
 //! # keystory
 //!
 //! A crash-resilient key/value store engine, built from scratch in approval-gated
-//! phases. `ROADMAP.md` is the design log: the threat/failure audit of each phase, the
-//! decisions taken, and the open backlog.
+//! phases. `ROADMAP.md` holds the state at handoff, the open backlog, the design
+//! decisions in force, and a condensed history of each phase.
 //!
 //! ## What is here
 //!
 //! | Module | Role |
 //! |--------|------|
-//! | [`engine`] | [`Store`], the public entry point: commit lock, WAL append + `fsync`, then RCU publish; `open` = last checkpoint + WAL-tail replay. |
-//! | [`wal`] | Append-only, segmented, CRC-guarded write-ahead log with torn-tail detection. |
-//! | [`snapshot`] | Durable checkpoint file: streamed body, tmp + `fsync` + atomic rename. |
+//! | [`engine`] | [`Store`], the public entry point: group commit (one WAL append + `fsync` per group), atomic batches, RCU publish; `open` = latest usable checkpoint + WAL-tail replay. |
+//! | [`wal`] | Append-only, segmented, CRC-guarded write-ahead log: torn-tail repair at open, batch records, segment boundaries for checkpoints. |
+//! | [`snapshot`] | Durable checkpoint file: streamed body, tmp + `fsync` + atomic rename, previous generation retained. |
 //! | [`rcu`] | `RcuSwap<T>`: the snapshot cell readers load without touching the commit lock. |
 //! | [`types`] | `Op`, `Entry`, `Snapshot`: the deterministic, index-ordered state model. |
 //! | [`checker`] | Offline MVCC sequential-consistency oracle used by the Jepsen-lite tests. |
-//! | [`raft`] | Pure Raft FSM, an in-process synchronous cluster driver, and an `async fn` facade. |
+//! | [`raft`] | Pure Raft FSM, an in-process synchronous cluster driver (sticky leader, leader reads), and an `async fn` facade. |
 //! | [`btree_store`] | Ordered B+ tree with a CRC-guarded document format; standalone, not used by `Store`. |
-//! | [`valuestore`] | Off-heap blob log for large values: a tested primitive, not yet wired into `Store`. |
-//! | [`epoch_rcu`] | Epoch-based reclamation model; not the hot path (see its docs). |
-//! | [`rt`] | Single-threaded cooperative async runtime with hand-built wakers. |
-//! | `asyncio` | `mio` reactor: real kernel readiness on a Unix-stream pair (Unix only). |
+//! | [`valuestore`] | Off-heap blob log for large values with ids stable across compaction: a tested primitive, not yet wired into `Store`. |
+//! | [`epoch_rcu`] | Thread-safe epoch-based reclamation model; not the hot path (see its docs). |
+//! | [`rt`] | Single-threaded cooperative async runtime with hand-built wakers, slot reuse and in-task spawning. |
+//! | `asyncio` | `mio` reactor: real kernel readiness on a Unix-stream pair, with deadlines (Unix only). |
 //!
 //! ## Policies
 //!
@@ -35,7 +35,7 @@
 //! The durable single-node engine and the Raft layer are **not yet integrated**: the
 //! cluster driver keeps in-memory logs and state and never touches [`Store`]. The
 //! cooperative runtime and the `mio` reactor are likewise not yet connected to each
-//! other. `ROADMAP.md` tracks both under the consolidation backlog.
+//! other. Both head the Phase 7 backlog in `ROADMAP.md`.
 #![allow(clippy::module_name_repetitions)]
 #![warn(clippy::all)]
 
@@ -56,7 +56,7 @@ pub mod valuestore;
 pub mod asyncio;
 pub mod rt;
 
-/// Re-export the public entry point at the crate root.
-pub use engine::Store;
+/// Re-export the public entry point (and its counters) at the crate root.
+pub use engine::{Stats, Store};
 /// Re-export the core value/op types for ergonomic `use keystory::...`.
-pub use types::{Entry, Op, Snapshot};
+pub use types::{Entry, Op, Shared, Snapshot};

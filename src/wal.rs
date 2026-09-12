@@ -8,24 +8,32 @@
 //!  offset  size  field
 //!    0      4    length           # bytes of `payload`
 //!    4      L    payload:
-//!                     tag   u8   1 = Put, 2 = Delete
+//!                     tag   u8   1 = Put, 2 = Delete, 3 = Batch
 //!                     term  u64  Raft term (1 on a single node)
 //!                     index u64  logical commit index
+//!                  tag 1 / 2 (one op):
 //!                     k_len u32
 //!                     key       [u8]
 //!                     v_len u32
 //!                     val       [u8]   (empty for Delete)
+//!                  tag 3 (one atomic commit of several ops):
+//!                     n     u32
+//!                     n x { sub_tag u8 (1/2), k_len u32, key, v_len u32, val }
 //!    4+L     4   crc32           # IEEE CRC-32 over `payload`
 //! ```
 //!
+//! A single-op commit uses tag 1/2, byte-for-byte the Phase-1 layout. A `Batch`
+//! record is one commit index applied all-or-nothing: the CRC covers every op, so a
+//! crash mid-record loses the whole batch and never a prefix of it.
+//!
 //! ## Crash model
 //!
-//! We `fsync` after *every* record (via `sync_all`), so a record that is fully
-//! on disk is durable. Under a `SIGKILL` mid-write the trailing partial record --
-//! a half-written `length`, `payload`, or `crc` -- is detected on replay by
-//! either (a) an out-of-bounds/undersized length, or (b) a CRC mismatch, and is
-//! discarded. Hence recovery loses **at most the last un-`fsync`-ed record** and
-//! nothing else: exactly the invariant the task demands.
+//! Every [`Wal::append_many`] ends with one `fsync`, so a record that is fully on disk
+//! is durable. Under a `SIGKILL` mid-write the trailing partial record -- a
+//! half-written `length`, `payload`, or `crc` -- is detected on replay by either (a)
+//! an out-of-bounds/undersized length, or (b) a CRC mismatch, and is discarded. Hence
+//! recovery loses **at most the records of the last un-`fsync`-ed group**, none of
+//! which were ever acknowledged to a caller.
 //!
 //! A torn tail is only legitimate in the **last** segment: a crash interrupts at most
 //! one append. A bad record in an earlier segment, with later segments present, is not
@@ -38,8 +46,9 @@
 //! [`Wal::open`] resumes the latest segment, first truncating any torn tail it finds
 //! so new records always start on a clean record boundary. Creating or rotating a
 //! segment `fsync`s the directory, so the new file's existence is as durable as its
-//! bytes. After a durable checkpoint the engine calls [`Wal::truncate_all`], which
-//! deletes every segment and starts a fresh one; nothing else ever deletes the log.
+//! bytes. The engine reclaims space with [`Wal::rotate_segment`] plus
+//! [`Wal::remove_segments_before`] (see `Store::checkpoint`); nothing else ever
+//! deletes the log.
 
 use std::fs::{File, OpenOptions, create_dir_all, remove_file};
 use std::io::{self, BufReader, Read, Write};
@@ -51,12 +60,28 @@ use crate::types::Op;
 /// Minimum payload size: any "length" smaller than this is a torn tail.
 const MIN_PAYLOAD: u32 = 1 + 8 + 8 + 4 + 4; // tag + term + index + k_len + v_len
 
-/// One replayed log record.
+const TAG_PUT: u8 = 1;
+const TAG_DELETE: u8 = 2;
+const TAG_BATCH: u8 = 3;
+
+/// One log record: a commit index and the ops applied at it, all-or-nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub term: u64,
     pub index: u64,
-    pub op: Op,
+    /// The ops of this commit. One for an ordinary put/delete; several for a batch.
+    pub ops: Vec<Op>,
+}
+
+impl Record {
+    /// A single-op record.
+    pub fn single(term: u64, index: u64, op: Op) -> Record {
+        Record {
+            term,
+            index,
+            ops: vec![op],
+        }
+    }
 }
 
 /// Where [`replay`] found a torn (partial or corrupt) trailing record.
@@ -115,26 +140,47 @@ impl Wal {
 
     /// Append one record and `fsync` it.
     ///
-    /// Invariant: *after `append` returns, `(term,index,op)` is durable and
-    /// will be replayed after any crash.*
+    /// Invariant: *after `append` returns, the record is durable and will be replayed
+    /// after any crash.*
     pub fn append(&mut self, rec: &Record) -> io::Result<()> {
-        let payload = encode_payload(rec);
-        let rec_bytes = 4 + payload.len() + 4;
-        // Rotate first if this record would overflow the current segment.
-        if self.seg_bytes + rec_bytes as u64 > self.max_seg_bytes && self.seg_bytes > 0 {
-            self.rotate()?;
+        self.append_many(std::slice::from_ref(rec))
+    }
+
+    /// Append several records with **one** `fsync` -- the group-commit primitive. The
+    /// records are written as one contiguous buffer; a crash mid-write leaves an intact
+    /// prefix of the group (each record is individually framed and checksummed), and no
+    /// caller is acknowledged before the `fsync` returns.
+    pub fn append_many(&mut self, recs: &[Record]) -> io::Result<()> {
+        if recs.is_empty() {
+            return Ok(());
         }
-        let mut buf = Vec::with_capacity(rec_bytes);
-        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&payload);
-        buf.extend_from_slice(&crc32(&payload).to_le_bytes());
+        let mut buf = Vec::new();
+        for rec in recs {
+            let payload = encode_payload(rec);
+            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&payload);
+            buf.extend_from_slice(&crc32(&payload).to_le_bytes());
+        }
+        // Rotate first if this group would overflow the current segment (a group larger
+        // than a segment simply makes an oversized segment).
+        if self.seg_bytes + buf.len() as u64 > self.max_seg_bytes && self.seg_bytes > 0 {
+            self.rotate_segment()?;
+        }
         self.file.write_all(&buf)?;
         self.file.sync_all()?; // fsync -> durable
-        self.seg_bytes += rec_bytes as u64;
+        self.seg_bytes += buf.len() as u64;
         Ok(())
     }
 
-    fn rotate(&mut self) -> io::Result<()> {
+    /// The sequence number of the segment currently being appended to.
+    pub fn current_segment(&self) -> u32 {
+        self.seg_seq
+    }
+
+    /// Close the current segment and start a fresh one, returning the new segment's
+    /// sequence number: every record appended from now on lives in a segment numbered
+    /// at or above it. Used by checkpoints to draw a boundary in the log.
+    pub fn rotate_segment(&mut self) -> io::Result<u32> {
         self.file.sync_all()?;
         self.seg_seq += 1;
         let path = segment_path(&self.dir, self.seg_seq);
@@ -144,11 +190,27 @@ impl Wal {
             .write(true)
             .open(&path)?;
         self.seg_bytes = 0;
-        fsync_dir(&self.dir) // the new segment's directory entry is durable too.
+        fsync_dir(&self.dir)?; // the new segment's directory entry is durable too.
+        Ok(self.seg_seq)
     }
 
-    /// Durably flush the current on-disk state (e.g. before a snapshot
-    /// checkpoint) without appending a new record.
+    /// Delete every segment numbered below `seq` (never the current one). Call only for
+    /// segments a durable checkpoint fully covers. Returns how many were removed.
+    pub fn remove_segments_before(&mut self, seq: u32) -> io::Result<usize> {
+        let mut removed = 0;
+        for p in list_segments(&self.dir)? {
+            if segment_seq(&p).is_some_and(|s| s < seq && s != self.seg_seq) {
+                remove_file(&p)?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            fsync_dir(&self.dir)?;
+        }
+        Ok(removed)
+    }
+
+    /// Durably flush the current on-disk state without appending a new record.
     pub fn sync(&mut self) -> io::Result<()> {
         self.file.sync_all()
     }
@@ -156,12 +218,9 @@ impl Wal {
     /// Delete every segment file in this log, then start a fresh one. Call only after
     /// a durable snapshot that fully covers their contents.
     pub fn truncate_all(&mut self) -> io::Result<()> {
-        for p in list_segments(&self.dir)? {
-            // Best-effort; a missing file is fine.
-            let _ = remove_file(&p);
-        }
-        // Open a fresh segment so subsequent appends write to a clean file.
-        self.rotate()
+        let boundary = self.rotate_segment()?;
+        self.remove_segments_before(boundary)?;
+        Ok(())
     }
 }
 
@@ -256,75 +315,122 @@ fn repair_tail(path: &Path) -> io::Result<Option<u64>> {
 // Encoding
 // ---------------------------------------------------------------------------
 
+fn op_tag(op: &Op) -> u8 {
+    match op {
+        Op::Put { .. } => TAG_PUT,
+        Op::Delete { .. } => TAG_DELETE,
+    }
+}
+
+/// `k_len, key, v_len, val` (an empty value for a delete).
+fn encode_op_body(op: &Op, b: &mut Vec<u8>) {
+    let (key, value): (&[u8], &[u8]) = match op {
+        Op::Put { key, value } => (key, value),
+        Op::Delete { key } => (key, &[]),
+    };
+    b.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    b.extend_from_slice(key);
+    b.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    b.extend_from_slice(value);
+}
+
 fn encode_payload(rec: &Record) -> Vec<u8> {
     let mut b = Vec::new();
-    b.push(match &rec.op {
-        Op::Put { .. } => 1,
-        Op::Delete { .. } => 2,
-    });
-    b.extend_from_slice(&rec.term.to_le_bytes());
-    b.extend_from_slice(&rec.index.to_le_bytes());
-    match &rec.op {
-        Op::Put { key, value } => {
-            b.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            b.extend_from_slice(key);
-            b.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            b.extend_from_slice(value);
+    match rec.ops.as_slice() {
+        [op] => {
+            b.push(op_tag(op));
+            b.extend_from_slice(&rec.term.to_le_bytes());
+            b.extend_from_slice(&rec.index.to_le_bytes());
+            encode_op_body(op, &mut b);
         }
-        Op::Delete { key } => {
-            b.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            b.extend_from_slice(key);
-            b.extend_from_slice(&0u32.to_le_bytes());
+        ops => {
+            b.push(TAG_BATCH);
+            b.extend_from_slice(&rec.term.to_le_bytes());
+            b.extend_from_slice(&rec.index.to_le_bytes());
+            b.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+            for op in ops {
+                b.push(op_tag(op));
+                encode_op_body(op, &mut b);
+            }
         }
     }
     b
 }
 
-fn decode_payload(b: &[u8]) -> Result<Record, io::Error> {
-    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
-    let mut cur = 0;
-    if cur >= b.len() {
-        return Err(bad("empty"));
+/// A bounded cursor over a payload: every read checks the remaining length.
+struct Cursor<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize, what: &str) -> io::Result<&'a [u8]> {
+        if self.at + n > self.b.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, what.to_string()));
+        }
+        let s = &self.b[self.at..self.at + n];
+        self.at += n;
+        Ok(s)
     }
-    let tag = b[cur];
-    cur += 1;
-    if cur + 8 > b.len() {
-        return Err(bad("term"));
+    fn u8(&mut self, what: &str) -> io::Result<u8> {
+        Ok(self.take(1, what)?[0])
     }
-    let term = u64::from_le_bytes(b[cur..cur + 8].try_into().expect("term len"));
-    cur += 8;
-    if cur + 8 > b.len() {
-        return Err(bad("index"));
+    fn u32(&mut self, what: &str) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(
+            self.take(4, what)?.try_into().expect("4 bytes"),
+        ))
     }
-    let index = u64::from_le_bytes(b[cur..cur + 8].try_into().expect("index len"));
-    cur += 8;
-    if cur + 4 > b.len() {
-        return Err(bad("k_len"));
+    fn u64(&mut self, what: &str) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(
+            self.take(8, what)?.try_into().expect("8 bytes"),
+        ))
     }
-    let k_len = u32::from_le_bytes(b[cur..cur + 4].try_into().expect("k_len")) as usize;
-    cur += 4;
-    if cur + k_len > b.len() {
-        return Err(bad("key body"));
+    fn remaining(&self) -> usize {
+        self.b.len() - self.at
     }
-    let key = b[cur..cur + k_len].to_vec();
-    cur += k_len;
-    if cur + 4 > b.len() {
-        return Err(bad("v_len"));
-    }
-    let v_len = u32::from_le_bytes(b[cur..cur + 4].try_into().expect("v_len")) as usize;
-    cur += 4;
-    if cur + v_len > b.len() {
-        return Err(bad("val body"));
-    }
-    let op = match tag {
-        1 => Op::Put {
+}
+
+fn decode_op(tag: u8, c: &mut Cursor<'_>) -> io::Result<Op> {
+    let k_len = c.u32("k_len")? as usize;
+    let key = c.take(k_len, "key body")?.to_vec();
+    let v_len = c.u32("v_len")? as usize;
+    let value = c.take(v_len, "val body")?;
+    match tag {
+        TAG_PUT => Ok(Op::Put {
             key,
-            value: b[cur..cur + v_len].to_vec(),
-        },
-        2 => Op::Delete { key },
-        _ => return Err(bad("bad tag")),
+            value: value.to_vec(),
+        }),
+        TAG_DELETE => Ok(Op::Delete { key }),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "bad tag")),
+    }
+}
+
+fn decode_payload(b: &[u8]) -> io::Result<Record> {
+    let mut c = Cursor { b, at: 0 };
+    let tag = c.u8("tag")?;
+    let term = c.u64("term")?;
+    let index = c.u64("index")?;
+    let ops = match tag {
+        TAG_PUT | TAG_DELETE => vec![decode_op(tag, &mut c)?],
+        TAG_BATCH => {
+            let n = c.u32("batch count")? as usize;
+            // Each op needs at least a tag and two lengths; a count beyond that is bogus.
+            if n == 0 || n > c.remaining() / 9 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "batch count"));
+            }
+            let mut ops = Vec::with_capacity(n);
+            for _ in 0..n {
+                let sub = c.u8("sub tag")?;
+                ops.push(decode_op(sub, &mut c)?);
+            }
+            ops
+        }
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad tag")),
     };
-    Ok(Record { term, index, op })
+    if c.remaining() != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "trailing bytes"));
+    }
+    Ok(Record { term, index, ops })
 }
 
 // ---------------------------------------------------------------------------
@@ -393,14 +499,14 @@ mod tests {
     }
 
     fn put(index: u64, key: &[u8], value: &[u8]) -> Record {
-        Record {
-            term: 1,
+        Record::single(
+            1,
             index,
-            op: Op::Put {
+            Op::Put {
                 key: key.to_vec(),
                 value: value.to_vec(),
             },
-        }
+        )
     }
 
     fn append_junk(seg: &Path) {
@@ -420,26 +526,59 @@ mod tests {
         let d = dir("wal-rt");
         let mut w = Wal::open(&d, 4096).unwrap();
         w.append(&put(1, b"a", b"1")).unwrap();
-        w.append(&Record {
-            term: 1,
-            index: 2,
-            op: Op::Delete { key: b"a".into() },
-        })
-        .unwrap();
+        w.append(&Record::single(1, 2, Op::Delete { key: b"a".into() }))
+            .unwrap();
         w.append(&put(3, b"z", b"\x00\x01\xff")).unwrap();
         let got = recs_clean(&d);
         assert_eq!(got.len(), 3);
         assert_eq!(got[0], put(1, b"a", b"1"));
         assert_eq!(
             got[1],
-            Record {
-                term: 1,
-                index: 2,
-                op: Op::Delete { key: b"a".into() },
-            }
+            Record::single(1, 2, Op::Delete { key: b"a".into() })
         );
         assert_eq!(got[2], put(3, b"z", b"\x00\x01\xff"));
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A batch record carries several ops under one index and decodes exactly; a
+    /// single-op record still uses the original tag-1/2 layout.
+    #[test]
+    fn batch_record_round_trips() {
+        let d = dir("wal-batch");
+        let mut w = Wal::open(&d, 4096).unwrap();
+        let batch = Record {
+            term: 1,
+            index: 1,
+            ops: vec![
+                Op::Put {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec(),
+                },
+                Op::Delete { key: b"b".to_vec() },
+                Op::Put {
+                    key: b"c".to_vec(),
+                    value: vec![0xAB; 300],
+                },
+            ],
+        };
+        w.append_many(&[batch.clone(), put(2, b"d", b"4")]).unwrap();
+        assert_eq!(encode_payload(&put(2, b"d", b"4"))[0], TAG_PUT);
+        assert_eq!(encode_payload(&batch)[0], TAG_BATCH);
+        let got = recs_clean(&d);
+        assert_eq!(got, vec![batch, put(2, b"d", b"4")]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A malformed batch payload (count larger than the bytes can hold) is rejected by
+    /// the bounded decoder rather than trusted.
+    #[test]
+    fn oversized_batch_count_is_rejected() {
+        let mut payload = vec![TAG_BATCH];
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&1_000_000u32.to_le_bytes());
+        payload.extend_from_slice(&[TAG_PUT, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(decode_payload(&payload).is_err());
     }
 
     #[test]
@@ -528,6 +667,36 @@ mod tests {
             assert_eq!(r.index, (i + 1) as u64);
         }
         assert!(list_segments(&d).unwrap().len() >= 2, "expected rotation");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// `rotate_segment` draws a boundary: records before it live in lower-numbered
+    /// segments, which `remove_segments_before` deletes while keeping the rest intact.
+    #[test]
+    fn rotate_then_remove_segments_before_boundary() {
+        let d = dir("wal-boundary");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        for i in 1..=5u64 {
+            w.append(&put(i, b"k", &i.to_le_bytes())).unwrap();
+        }
+        let boundary = w.rotate_segment().unwrap();
+        for i in 6..=8u64 {
+            w.append(&put(i, b"k", &i.to_le_bytes())).unwrap();
+        }
+        assert_eq!(list_segments(&d).unwrap().len(), 2);
+        assert_eq!(w.remove_segments_before(boundary).unwrap(), 1);
+        assert_eq!(w.current_segment(), boundary);
+        let got = recs_clean(&d);
+        assert_eq!(
+            got.iter().map(|r| r.index).collect::<Vec<_>>(),
+            vec![6, 7, 8],
+            "only the records after the boundary remain"
+        );
+        assert_eq!(
+            w.remove_segments_before(boundary + 5).unwrap(),
+            0,
+            "the current segment is never removed"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 

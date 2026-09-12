@@ -1,7 +1,7 @@
 //! Epoch-based reclamation (the model behind an RCU read path), Phase 5 (2/3).
 //!
-//! This closes open question #3 — *"should `RcuSwap` move to true epoch-based
-//! reclamation so readers never take a write lock?"* — by implementing the
+//! This closes open question #3 -- *"should `RcuSwap` move to true epoch-based
+//! reclamation so readers never take a write lock?"* -- by implementing the
 //! reclamation mechanism and proving, by construction, the property that makes it
 //! attractive: **an old version is not freed until its grace period has elapsed, i.e.
 //! every reader that began its critical section *before* the publish has since exited.**
@@ -16,37 +16,37 @@
 //! * [`Rcu::publish`] advances the epoch and *defers* the old version into a
 //!   retirement queue, tagged with the epoch at which it was retired.
 //! * [`Rcu::reclaim`] frees a deferred version only when **every active reader entered
-//!   at or after the retiree's epoch** — i.e. no live reader could still be holding it.
+//!   at or after the retiree's epoch** -- i.e. no live reader could still be holding it.
 //!
 //! The grace-period test is a *quiescent-state* check on the minimum active entry epoch:
-//! a retiree tagged `E` is free once the minimum entry epoch of all active readers has
-//! passed `E` (no active reader began before the publish that retired it). This is the
-//! textbook epoch-relation and is race-free for the cooperative, single-producer model
-//! this system runs under. A production, async-safe variant would *additionally* guard
-//! a reader that parks inside its critical section and a writer preempted mid-publish --
-//! the same care a kernel RCU takes -- and is out of scope here: that is exactly why epoch
-//! reclamation is **demonstrated and reasoned about** below rather than wired into the hot
-//! `RcuSwap` path, whose correctness is already established by the snapshot test.
+//! a retiree tagged `E` is free once no active reader entered before `E`. A reader
+//! registers its entry epoch *before* it clones the current version, and a version is
+//! only retired *after* it stops being current, so any version a reader can hold was
+//! retired at an epoch strictly greater than that reader's entry: the check is sound
+//! with readers and writers on different threads (`Rcu<T>` is `Send + Sync` for
+//! `T: Send + Sync`), including a reader that parks inside its critical section (it
+//! simply delays reclamation) and a writer preempted mid-publish.
+//!
+//! What keeps this a *model* rather than the store's hot path is performance, not
+//! safety: the reader registry and the retirement queue sit behind mutexes, so a read
+//! takes two short lock acquisitions where a production RCU takes none. The live
+//! [`crate::rcu::RcuSwap`] (an `RwLock<Arc<_>>`) already gives readers snapshot
+//! isolation with one lock; replacing it is tracked in `ROADMAP.md`.
 //!
 //! **Observability is measured, not claimed.** A retired version is kept as a *strong*
 //! reference in the queue, so its `Drop` (and `Arc` decrement) is deferred until
 //! `reclaim` drops it. The tests assert this directly: a version's observer `Drop` fires
 //! only after quiescence, and `pending()` / `reclaim()` counts track the queue.
-//!
-#![allow(clippy::arc_with_non_send_sync)]
 
+use std::any::Any;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 
-// This is a single-producer, cooperative *model* of epoch reclamation: the retiree is
-// an `Arc<Box<dyn Any>>` (not Send/Sync) held only behind one `Mutex`, driven from a
-// single logical producer. A production variant would bound `T: Send + Sync` and use raw
-// slots; that boundary is out of scope here, but the grace-period logic is the substance.
-
-// A deferred version, tagged with the epoch at which it was retired.
-type Retiree = (u64, Arc<Box<dyn std::any::Any>>);
+/// A deferred version, tagged with the epoch at which it was retired. Type-erased so one
+/// manager can serve any `T`; `Send + Sync` so the queue may be shared across threads.
+type Retiree = (u64, Arc<dyn Any + Send + Sync>);
 
 /// A monotonic epoch counter plus a quiescent-state tracker for deferred reclamation.
 #[derive(Debug, Default)]
@@ -72,17 +72,15 @@ impl EpochManager {
     /// Enter a critical section: records this reader's entry epoch. Any version
     /// retired at or after this epoch cannot be freed while the returned guard lives.
     pub fn enter(&self) -> Reader<'_> {
-        let e = self.epoch.load(Ordering::Acquire);
-        self.active.lock().unwrap().push(e);
         Reader {
             mgr: self,
-            entry: e,
+            entry: self.enter_raw(),
         }
     }
 
     /// Retire an old version: defer it, tagged with the just-advanced epoch. It is not
     /// freed until its grace period elapses. Returns the new epoch.
-    pub fn retire(&self, version: Arc<Box<dyn std::any::Any>>) -> u64 {
+    pub fn retire(&self, version: Arc<dyn Any + Send + Sync>) -> u64 {
         let e = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.retired.lock().unwrap().push((e, version));
         e
@@ -100,14 +98,7 @@ impl EpochManager {
             .min()
             .unwrap_or(u64::MAX);
         let mut q = self.retired.lock().unwrap();
-        let mut freed = 0usize;
-        for (i, (ep, _v)) in q.iter().enumerate() {
-            if *ep <= min_active {
-                freed = i + 1;
-            } else {
-                break;
-            }
-        }
+        let freed = q.iter().take_while(|(ep, _)| *ep <= min_active).count();
         q.drain(0..freed);
         freed
     }
@@ -115,6 +106,8 @@ impl EpochManager {
     /// Register a reader entry and return its epoch (for test-controlled handles).
     #[doc(hidden)]
     pub fn enter_raw(&self) -> u64 {
+        // Register first, then let the caller clone: a version retired after this point
+        // is tagged above `e`, so it cannot be freed while this entry is active.
         let e = self.epoch.load(Ordering::Acquire);
         self.active.lock().unwrap().push(e);
         e
@@ -123,6 +116,13 @@ impl EpochManager {
     /// How many versions are pending reclamation.
     pub fn pending(&self) -> usize {
         self.retired.lock().unwrap().len()
+    }
+
+    fn exit(&self, entry: u64) {
+        let mut active = self.active.lock().unwrap();
+        if let Some(i) = active.iter().position(|&e| e == entry) {
+            active.swap_remove(i);
+        }
     }
 }
 
@@ -136,21 +136,18 @@ pub struct Reader<'a> {
 
 impl Drop for Reader<'_> {
     fn drop(&mut self) {
-        let mut active = self.mgr.active.lock().unwrap();
-        if let Some(i) = active.iter().position(|&e| e == self.entry) {
-            active.remove(i);
-        }
+        self.mgr.exit(self.entry);
     }
 }
 
 /// An epoch-guarded cell: one current version, old versions deferred to a grace-period
-/// queue.
-pub struct Rcu<T: 'static> {
+/// queue. Shareable across threads (`Send + Sync`) for `T: Send + Sync`.
+pub struct Rcu<T: Send + Sync + 'static> {
     current: Mutex<Arc<T>>,
     mgr: EpochManager,
 }
 
-impl<T: 'static> Rcu<T> {
+impl<T: Send + Sync + 'static> Rcu<T> {
     pub fn new(v: T) -> Self {
         Rcu {
             current: Mutex::new(Arc::new(v)),
@@ -170,7 +167,7 @@ impl<T: 'static> Rcu<T> {
     /// Publish a new version, deferring the old one into the grace-period queue.
     pub fn publish(&self, v: T) {
         let old = std::mem::replace(&mut *self.current.lock().unwrap(), Arc::new(v));
-        self.mgr.retire(to_boxed(old));
+        self.mgr.retire(old as Arc<dyn Any + Send + Sync>);
     }
 
     /// Free any deferred version whose grace period has elapsed.
@@ -188,10 +185,6 @@ impl<T: 'static> Rcu<T> {
     pub fn _mgr(&self) -> &EpochManager {
         &self.mgr
     }
-}
-
-fn to_boxed<T: 'static>(arc: Arc<T>) -> Arc<Box<dyn std::any::Any>> {
-    Arc::new(Box::new(arc) as Box<dyn std::any::Any>)
 }
 
 // ============================ unit tests ============================
@@ -307,14 +300,50 @@ mod test {
         assert_eq!(rc.reclaim(), 1, "all gone -> free");
     }
 
+    /// Regression (Phase 6): the cell is shareable across threads. Readers snapshot
+    /// continuously while a writer publishes and reclaims; versions never regress, no
+    /// reader observes a freed version (Rust would not let it), and once the readers
+    /// are gone everything pending is reclaimable.
+    #[test]
+    fn shared_across_threads_reclaims_after_readers_leave() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Rcu<u64>>();
+
+        let rc = Arc::new(Rcu::new(0u64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let rc = Arc::clone(&rc);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut seen = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let (_guard, v) = rc.snapshot();
+                        assert!(*v >= seen, "versions never regress");
+                        seen = *v;
+                    }
+                })
+            })
+            .collect();
+        for i in 1..=5_000u64 {
+            rc.publish(i);
+            if i % 100 == 0 {
+                rc.reclaim();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().expect("reader thread");
+        }
+        rc.reclaim();
+        assert_eq!(rc.pending(), 0, "no reader left, so nothing stays deferred");
+    }
+
     /// A small reader handle with an explicit `.exit()`, for clean test control.
     struct R<'a>(&'a EpochManager, u64);
-    impl<'a> R<'a> {
+    impl R<'_> {
         fn exit(self) {
-            let mut active = self.0.active.lock().unwrap();
-            if let Some(i) = active.iter().position(|&e| e == self.1) {
-                active.remove(i);
-            }
+            self.0.exit(self.1);
         }
     }
     fn _enter(rc: &Rcu<u32>) -> R<'_> {
