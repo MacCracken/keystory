@@ -44,6 +44,9 @@ pub struct ReadRec {
     pub value: Option<Vec<u8>>,
 }
 
+/// One write entry: its commit index and the value it left visible.
+type IndexedWrite = (u64, Stored);
+
 /// A per-key, MVCC-aware consistency checker.
 ///
 /// `writes` is per-key, sorted ascending by commit index. `reads` is the flattened log
@@ -51,9 +54,6 @@ pub struct ReadRec {
 /// the model concurrently. Writers record *after* their commit returns, outside the
 /// engine's lock, so interleaved writers on one key may record out of order; `check`
 /// sorts each key's log by commit index before validating anything.
-/// One write entry: its commit index and the value it left visible.
-type IndexedWrite = (u64, Stored);
-
 #[derive(Default)]
 pub struct Model {
     /// key -> writes, kept sorted ascending by commit index.

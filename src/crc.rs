@@ -91,7 +91,7 @@ mod test {
 
     /// Known-answer: an empty input hashes to the standard CRC-32 of the empty string.
     #[test]
-    fn empty_is_ff_ffff_ffff() {
+    fn empty_input_is_zero() {
         assert_eq!(crc32(b""), 0x0000_0000);
     }
 
@@ -120,7 +120,7 @@ mod test {
         assert_eq!(a, b, "deterministic");
         assert_eq!(
             crc32(b"the quick brown fox jumps over the lazy dog"),
-            0x0CE0_C5114
+            0xCE0C_5114
         );
     }
 }
