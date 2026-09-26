@@ -2,8 +2,9 @@
 //! runs on the std-only, no-deps cooperative runtime in [`crate::rt`].
 //!
 //! # Design: an async API over a synchronous core, honestly scoped
-//! There is no asynchronous I/O source yet (non-blocking sockets need `libc`; see the Phase-4
-//! scope note). So this driver does not await a real I/O boundary -- it awaits a modeled one
+//! There is no asynchronous I/O source behind the runtime yet (the `mio` reactor in
+//! `crate::asyncio` is not connected to it; see `ROADMAP.md`). So this driver does not await a
+//! real I/O boundary -- it awaits a modeled one
 //! ([`crate::rt::yield_once`], a one-shot cooperative yield) *between* the synchronous replicated
 //! steps. This proves the *programming model* end-to-end: a workload is written as one async
 //! block, the cooperative scheduler drives every `.await` point, and the replicated result is

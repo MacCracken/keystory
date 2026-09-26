@@ -318,7 +318,7 @@ pub(crate) fn cluster_commit(cluster: &RaftCluster, op: Op) -> Result<u64, Clust
     let ci = g.nodes[&leader].commit_idx;
     assert_eq!(ci, idx, "a majority holds index {idx} => it is committed");
     // 5) Apply the newly committed entry to every live node, then record the op.
-    apply_committed(&mut g, ci);
+    apply_committed(&mut g, leader, ci);
     if let Some(m) = cluster.model.as_ref() {
         match op {
             Op::Put { key, value } => m.record_write(ci, key, Some(value)),
@@ -328,16 +328,21 @@ pub(crate) fn cluster_commit(cluster: &RaftCluster, op: Op) -> Result<u64, Clust
     Ok(ci)
 }
 
-/// Push a peer's log up to `idx` (the leader's tip) via `AppendEntries`, resending from
-/// wherever the follower says it still agrees after it drops a divergent tail. Returns
-/// whether the peer reached `idx`; `false` only if the follower rejects without making
-/// progress, which means it is ahead of this leader (a stale leader).
+/// Bring a peer's log into agreement with the leader's through `idx` (the leader's tip)
+/// via `AppendEntries`, resending from wherever the follower says it still agrees after
+/// it drops a divergent tail. Returns whether the peer now holds the leader's entries
+/// through `idx`; `false` only if the follower rejects without making progress, which
+/// means it is ahead of this leader (a stale leader).
 fn peer_catch_up(g: &mut Inner, leader: NodeId, peer: NodeId, idx: u64, lterm: u64) -> bool {
+    if idx == 0 {
+        return true; // an empty prefix agrees with every log
+    }
     loop {
-        let start = g.nodes[&peer].log.last_index() + 1;
-        if start > idx {
-            return true;
-        }
+        // Resend from the peer's tip -- but always at least the entry at `idx`: a peer
+        // whose log is already that long may hold a stale entry there (from a leader
+        // that failed before replicating it), and only an append that reaches `idx`
+        // makes it run the log-matching check. Length alone proves nothing.
+        let start = (g.nodes[&peer].log.last_index() + 1).min(idx);
         let prev_idx = start - 1;
         let prev_term = g.nodes[&leader].log.term_of(prev_idx).unwrap_or(0);
         let leader_commit = g.nodes[&leader].commit_idx;
@@ -353,11 +358,14 @@ fn peer_catch_up(g: &mut Inner, leader: NodeId, peer: NodeId, idx: u64, lterm: u
             &suffix,
             leader_commit,
         );
-        if res.is_some() && g.nodes[&peer].log.last_index() == before {
-            return false; // rejected without truncating anything: the follower is ahead.
+        match res {
+            // Accepted: the prefix matched and the peer now holds our entries to `idx`.
+            None => return true,
+            // Rejected without truncating anything: the follower's term is ahead of ours.
+            Some(_) if g.nodes[&peer].log.last_index() == before => return false,
+            // The follower dropped a divergent tail; resend from its corrected tip.
+            Some(_) => {}
         }
-        // Accepted, or the follower truncated a divergent tail; the next iteration
-        // resends from its corrected tip.
     }
 }
 
@@ -373,16 +381,24 @@ fn sync_live_followers(g: &mut Inner, leader: NodeId) {
         }
     }
     let ci = g.nodes[&leader].commit_idx;
-    apply_committed(g, ci);
+    apply_committed(g, leader, ci);
 }
 
-/// Apply the committed suffix `[applied+1 ..= upto]` to every **live** node's state machine,
-/// advancing each node's `commit_idx`/`applied` so the views converge.
-fn apply_committed(g: &mut Inner, upto: u64) {
+/// Apply the committed suffix `[applied+1 ..= upto]` to every **live** node whose log
+/// agrees with the leader's through `upto`, advancing its `commit_idx`/`applied` so the
+/// views converge. A node that does not agree (one the catch-up could not reach) keeps
+/// its commit index: committing up to `upto` on a divergent log would apply entries the
+/// cluster never committed.
+fn apply_committed(g: &mut Inner, leader: NodeId, upto: u64) {
     let live = g.live();
+    let leader_term_at = g.nodes[&leader].log.term_of(upto);
     for n in g.nodes.values_mut() {
         if !live.contains(&n.id) {
             continue; // only live nodes participate.
+        }
+        // Log matching: the same term at `upto` means identical logs through it.
+        if n.log.term_of(upto) != leader_term_at {
+            continue;
         }
         n.commit_idx = n.commit_idx.max(upto);
         n.apply_committed();
@@ -463,6 +479,59 @@ mod test {
             "revived node caught up"
         );
         assert_eq!(c.leader(), Some(leader), "the leader did not change");
+    }
+
+    /// Regression (2026-09-26 audit): a follower whose log was *longer* than the leader's
+    /// tip counted as caught up without a single entry being compared, so a stale tail
+    /// (entries a leader appended but never replicated before it failed) was acknowledged,
+    /// marked committed and applied -- and the next read panicked on the divergence.
+    #[test]
+    fn a_longer_stale_follower_log_is_repaired_not_counted_as_an_ack() {
+        use crate::raft::node::LogEntry;
+        let c = RaftCluster::new(3);
+        c.put(b"a", b"1").unwrap(); // leader 0, term 1: every node holds t1@1
+        assert_eq!(c.leader(), Some(0));
+        {
+            // Leader 0 appends three entries locally, then fails before replicating them.
+            let mut g = c.inner.lock().unwrap();
+            let old = g.nodes.get_mut(&0).unwrap();
+            let stale = |k: &[u8]| {
+                LogEntry::new(
+                    1,
+                    Op::Put {
+                        key: k.to_vec(),
+                        value: b"STALE".to_vec(),
+                    },
+                )
+            };
+            old.log.append(&[stale(b"a"), stale(b"z"), stale(b"y")]);
+        }
+        c.fail(0);
+        c.put(b"c", b"3").unwrap(); // node 1 leads term 2
+        c.revive(0);
+        c.put(b"d", b"4").unwrap(); // index 3: below node 0's stale tip at 4
+
+        assert_eq!(c.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(
+            c.get(b"z").unwrap(),
+            None,
+            "the stale write never took effect"
+        );
+        let g = c.inner.lock().unwrap();
+        let leader_log = g.nodes[&g.leader.unwrap()].log.clone();
+        for n in g.nodes.values() {
+            assert_eq!(
+                n.log, leader_log,
+                "node {} converged on the leader's log",
+                n.id
+            );
+            assert_eq!(
+                n.get(b"z"),
+                None,
+                "node {} never applied the stale tail",
+                n.id
+            );
+        }
     }
 
     /// A leader stays leader across writes: no election runs while a live leader exists.

@@ -11,7 +11,11 @@ condensed history.
 
 - **Durable writes.** Every `put`/`delete` is appended to a segmented, CRC-guarded
   write-ahead log and `fsync`'d *before* it becomes visible. A torn trailing record
-  is detected and truncated on the next open, never trusted.
+  is detected and truncated on the next open, never trusted. A failed append (a full
+  disk, say) is rolled back, so an I/O error never costs an acknowledged write, and
+  recovery refuses a log with missing records rather than opening short.
+- **One owner per directory.** `open` locks the store directory; a second open, in this
+  process or another, fails with `WouldBlock` instead of corrupting the live store.
 - **Group commit and batches.** Concurrent writers share one WAL append and one
   `fsync` per group (measured: 32 threads reach about 10× the single-thread rate);
   `put_batch` applies several ops under one index, all-or-nothing under a crash.
@@ -88,8 +92,9 @@ fn main() -> std::io::Result<()> {
 
 ## Status and known gaps
 
-Phases 1 to 6 are complete; Phase 6 was a full review followed by consolidation, and
-`ROADMAP.md` records exactly what the tests prove and what was measured. The headline
+Phases 1 to 6 are complete; Phase 6 was a full review followed by consolidation, plus a
+follow-up audit on 2026-09-26 whose fixes are listed in its history. `ROADMAP.md`
+records exactly what the tests prove and what was measured. The headline
 gaps, all in the Phase 7 backlog there: the Raft layer does not yet use the durable
 store, there is no network transport, the runtime and the reactor are not connected,
 and the snapshot map is still cloned whole (though not its bytes) on every commit.

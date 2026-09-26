@@ -251,8 +251,10 @@ impl Node {
     /// it and everything after (Raft §5.3). `voted_for` survives an append in the same
     /// term: the vote belongs to the term, not to the message.
     ///
-    /// Updates `commit_idx` up to `leader_commit` (but never past a locally-known entry) --
-    /// the mechanism by which a commit "propagates" to followers.
+    /// Updates `commit_idx` up to `leader_commit`, but never past the last entry this
+    /// message vouched for (`prev_index + entries.len()`) -- the mechanism by which a
+    /// commit "propagates" to followers. Anything after that entry may be a stale tail
+    /// from an old term that this leader has not yet checked.
     pub fn append_entries(
         &mut self,
         from: NodeId,
@@ -307,8 +309,12 @@ impl Node {
             }
         }
 
-        // 3) Commit up to the leader's commit, but never past what we actually hold.
-        let safe = std::cmp::min(leader_commit, self.log.last_index());
+        // 3) Commit up to the leader's commit, but never past the last entry this message
+        //    covered (Raft §5.3, "index of last new entry"): the log-matching check above
+        //    proves agreement with the leader only up to there, and a longer local log may
+        //    continue with a stale tail the leader will overwrite.
+        let last_new = prev_index + entries.len() as u64;
+        let safe = std::cmp::min(leader_commit, last_new);
         if safe > self.commit_idx {
             self.commit_idx = safe;
         }
@@ -601,6 +607,50 @@ mod tests {
         assert_eq!(f.log.term_of(2), Some(2));
         assert_eq!(f.log.get(2).unwrap().cmd, Op::Delete { key: b"p".to_vec() });
         assert_eq!(f.log.get(3).unwrap().cmd, Op::Delete { key: b"q".to_vec() });
+    }
+
+    /// Regression (2026-09-26 audit): a follower used to advance `commit_idx` to
+    /// `min(leader_commit, own last index)`, so a heartbeat that only proved agreement up
+    /// to `prev_index` let it commit -- and apply -- a stale tail from an old term that
+    /// the leader's log does not contain. Commit stops at the last entry the message
+    /// covered, and the stale entry is replaced before it is ever applied.
+    #[test]
+    fn heartbeat_does_not_commit_a_stale_tail_past_the_checked_prefix() {
+        let mut f = Node::new(1, BTreeSet::from([0u64, 1, 2]));
+        f.log.append(&[
+            LogEntry::new(1, Op::Delete { key: b"a".to_vec() }),
+            LogEntry::new(
+                1,
+                Op::Delete {
+                    key: b"stale".to_vec(),
+                },
+            ),
+            LogEntry::new(
+                1,
+                Op::Delete {
+                    key: b"stale-too".to_vec(),
+                },
+            ),
+        ]);
+        // The term-2 leader holds [t1@1, t2@2] and has committed 2; this heartbeat is
+        // anchored at index 1, the last point on which the two logs are known to agree.
+        assert!(f.append_entries(0, 2, 1, 1, &[], 2).is_none());
+        assert_eq!(f.commit_idx, 1, "only the checked prefix is committed");
+        f.apply_committed();
+        assert_eq!(f.applied, 1, "the stale t1@2 was not applied");
+
+        // The leader's own entry 2 replaces the stale one; now it may commit.
+        let own = [LogEntry::new(
+            2,
+            Op::Delete {
+                key: b"fresh".to_vec(),
+            },
+        )];
+        assert!(f.append_entries(0, 2, 1, 1, &own, 2).is_none());
+        assert_eq!(f.log.term_of(2), Some(2));
+        assert_eq!(f.commit_idx, 2);
+        f.apply_committed();
+        assert_eq!(f.applied, 2);
     }
 
     /// A heartbeat in the same term must not reset `votedFor`, or a node could vote twice

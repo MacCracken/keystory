@@ -22,7 +22,7 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use crate::crc::crc32;
@@ -398,30 +398,35 @@ fn assert_invariants(node: &Node, is_root: bool) {
 
 // ---------------- on-disk format + commit ----------------
 
-fn node_page(node: &Node, out: &mut Vec<u8>) {
+/// The deepest page nesting a document may have. A real tree never comes close (its height
+/// grows only when the root splits, and each level multiplies the minimum key count by at
+/// least three); the bound keeps a crafted document from exhausting the stack.
+const MAX_DEPTH: usize = 64;
+
+fn node_page(node: &Node, out: &mut Vec<u8>) -> io::Result<()> {
     let mut body = Vec::new();
     match node {
         Node::Leaf(leaf) => {
             body.push(0);
-            write_u32(leaf.entries.len() as u32, &mut body);
+            write_u32(len32(leaf.entries.len())?, &mut body);
             for (k, v) in leaf.entries.iter() {
-                write_u32(k.len() as u32, &mut body);
+                write_u32(len32(k.len())?, &mut body);
                 body.extend_from_slice(k);
-                write_u32(v.len() as u32, &mut body);
+                write_u32(len32(v.len())?, &mut body);
                 body.extend_from_slice(v);
             }
         }
         Node::Internal(inner) => {
             body.push(1);
-            write_u32(inner.keys.len() as u32, &mut body);
+            write_u32(len32(inner.keys.len())?, &mut body);
             for k in inner.keys.iter() {
-                write_u32(k.len() as u32, &mut body);
+                write_u32(len32(k.len())?, &mut body);
                 body.extend_from_slice(k);
             }
-            write_u32(inner.children.len() as u32, &mut body);
+            write_u32(len32(inner.children.len())?, &mut body);
             for c in inner.children.iter() {
                 let mut child = Vec::new();
-                node_page(c, &mut child);
+                node_page(c, &mut child)?;
                 write_u64(child.len() as u64, &mut body);
                 body.extend_from_slice(&child);
             }
@@ -431,6 +436,18 @@ fn node_page(node: &Node, out: &mut Vec<u8>) {
     out.extend_from_slice(&MAGIC.to_le_bytes());
     out.extend_from_slice(&body);
     out.extend_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
+
+/// A length for a `u32` field, or `InvalidInput` when it does not fit. Never truncated: a
+/// truncated length would still carry a valid CRC and decode as a different tree.
+fn len32(len: usize) -> io::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a length of {len} exceeds the document's u32 framing"),
+        )
+    })
 }
 
 fn write_u32(v: u32, bytes: &mut Vec<u8>) {
@@ -441,102 +458,121 @@ fn write_u64(v: u64, bytes: &mut Vec<u8>) {
     bytes.extend_from_slice(&v.to_le_bytes());
 }
 
-fn read_u32(bytes: &[u8], pos: &mut usize) -> u32 {
-    let v = u32::from_le_bytes([
-        bytes[*pos],
-        bytes[*pos + 1],
-        bytes[*pos + 2],
-        bytes[*pos + 3],
-    ]);
-    *pos += 4;
-    v
+/// A bounded cursor over a page body: every read checks the remaining length, so a
+/// length field that lies yields `None`, never an out-of-bounds panic.
+struct Cursor<'a> {
+    b: &'a [u8],
+    at: usize,
 }
 
-fn read_u64(bytes: &[u8], pos: &mut usize) -> u64 {
-    let v = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().expect("8-byte read"));
-    *pos += 8;
-    v
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(n)?;
+        let s = self.b.get(self.at..end)?;
+        self.at = end;
+        Some(s)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<usize> {
+        let b = self.take(4)?.try_into().ok()?;
+        usize::try_from(u32::from_le_bytes(b)).ok()
+    }
+
+    fn u64(&mut self) -> Option<usize> {
+        let b = self.take(8)?.try_into().ok()?;
+        usize::try_from(u64::from_le_bytes(b)).ok()
+    }
+
+    fn remaining(&self) -> usize {
+        self.b.len() - self.at
+    }
 }
 
-/// Parse a single page into a node, verifying the CRC; `None` on corruption.
-fn parse_page(bytes: &[u8]) -> Option<Node> {
-    if bytes.len() < 4 + 4 + 4 {
+/// Parse a single page into a node, verifying its magic and CRC; `None` on corruption.
+/// Every read is bounded and the shape is checked -- an internal node has at least two
+/// children and exactly one more child than keys (routing indexes children by key
+/// position), nesting stays under [`MAX_DEPTH`], and nothing follows a page's last field
+/// -- so a malformed page is rejected even when its CRC is valid, never a panic.
+fn parse_page(bytes: &[u8], depth: usize) -> Option<Node> {
+    if depth > MAX_DEPTH || bytes.len() < 4 + 4 {
         return None;
     }
-    let got_magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if got_magic != MAGIC {
+    let (magic, rest) = bytes.split_at(4);
+    if u32::from_le_bytes(magic.try_into().ok()?) != MAGIC {
         return None;
     }
-    let body = &bytes[4..bytes.len() - 4];
-    let last4 = [
-        bytes[bytes.len() - 4],
-        bytes[bytes.len() - 3],
-        bytes[bytes.len() - 2],
-        bytes[bytes.len() - 1],
-    ];
-    let got_crc = u32::from_le_bytes(last4);
-    if got_crc != crc32(body) {
+    let (body, crc) = rest.split_at(rest.len() - 4);
+    if u32::from_le_bytes(crc.try_into().ok()?) != crc32(body) {
         return None;
     }
-    let mut pos = 0usize;
-    let ty = body[pos];
-    pos += 1;
-    let node = match ty {
+    let mut c = Cursor { b: body, at: 0 };
+    let node = match c.u8()? {
         0 => {
-            let n = read_u32(body, &mut pos) as usize;
+            let n = c.u32()?;
+            if n > c.remaining() / 8 {
+                return None; // each entry needs two length fields: the count is bogus
+            }
             let mut entries = Vec::with_capacity(n);
             for _ in 0..n {
-                let kl = read_u32(body, &mut pos) as usize;
-                let k = body[pos..pos + kl].to_vec();
-                pos += kl;
-                let vl = read_u32(body, &mut pos) as usize;
-                let v = body[pos..pos + vl].to_vec();
-                pos += vl;
+                let kl = c.u32()?;
+                let k = c.take(kl)?.to_vec();
+                let vl = c.u32()?;
+                let v = c.take(vl)?.to_vec();
                 entries.push((k, v));
             }
             Node::Leaf(Leaf { entries })
         }
         1 => {
-            let n = read_u32(body, &mut pos) as usize;
+            let n = c.u32()?;
+            if n > c.remaining() / 4 {
+                return None; // each key needs a length field: the count is bogus
+            }
             let mut keys = Vec::with_capacity(n);
             for _ in 0..n {
-                let kl = read_u32(body, &mut pos) as usize;
-                keys.push(body[pos..pos + kl].to_vec());
-                pos += kl;
+                let kl = c.u32()?;
+                keys.push(c.take(kl)?.to_vec());
             }
-            let cn = read_u32(body, &mut pos) as usize;
+            let cn = c.u32()?;
+            if n == 0 || cn != n + 1 {
+                return None;
+            }
             let mut children = Vec::with_capacity(cn);
             for _ in 0..cn {
-                let clen = read_u64(body, &mut pos) as usize;
-                let child_bytes = &body[pos..pos + clen];
-                pos += clen;
-                children.push(parse_page(child_bytes)?);
+                let clen = c.u64()?;
+                children.push(parse_page(c.take(clen)?, depth + 1)?);
             }
             Node::Internal(Internal { keys, children })
         }
         _ => return None,
     };
-    Some(node)
+    (c.remaining() == 0).then_some(node)
 }
 
-fn tree_document(root: &Node) -> Vec<u8> {
+fn tree_document(root: &Node) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
-    node_page(root, &mut body);
+    node_page(root, &mut body)?;
     let mut doc = Vec::new();
     doc.extend_from_slice(&MAGIC.to_le_bytes());
     doc.extend_from_slice(&body);
     doc.extend_from_slice(&crc32(&body).to_le_bytes());
-    doc
+    Ok(doc)
 }
 
-/// Persist the current tree to `dir/btree.dat` crash-safely (temp + fsync + rename).
-pub fn commit(dir: &Path, tree: &BTree) -> std::io::Result<()> {
-    commit_document(dir, &tree_document(&tree.root))
+/// Persist the current tree to `dir/btree.dat` crash-safely (temp + fsync + rename +
+/// directory fsync). A key or value longer than the format's `u32` framing is refused
+/// with `InvalidInput`.
+pub fn commit(dir: &Path, tree: &BTree) -> io::Result<()> {
+    commit_document(dir, &tree_document(&tree.root)?)
 }
 
-/// Persist a raw document to `dir/btree.dat` crash-safely. Exposed so tests can exercise commit /
-/// reload without going through a `BTree`.
-pub fn commit_document(dir: &Path, doc: &[u8]) -> std::io::Result<()> {
+/// Persist a raw document to `dir/btree.dat` crash-safely: the bytes are fsync'd before the
+/// rename, and the directory after it, so the new document is durable once this returns.
+/// Exposed so tests can exercise commit / reload without going through a `BTree`.
+pub fn commit_document(dir: &Path, doc: &[u8]) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let live = dir.join("btree.dat");
     let tmp = dir.join("btree.tmp");
@@ -552,23 +588,26 @@ pub fn commit_document(dir: &Path, doc: &[u8]) -> std::io::Result<()> {
         w.into_inner()?.sync_all()?;
     }
     std::fs::rename(&tmp, &live)?;
-    Ok(())
+    // POSIX promises nothing about the rename until the directory itself is synced.
+    crate::wal::fsync_dir(dir)
 }
 
 /// Load a tree from `dir`, or an empty tree if no file exists; a CRC-mismatched or corrupt
-/// document is rejected (`Err`), not silently recovered.
-pub fn open(dir: &Path) -> std::io::Result<BTree> {
+/// document is rejected with an `InvalidData` error, not silently recovered.
+pub fn open(dir: &Path) -> io::Result<BTree> {
     let live = dir.join("btree.dat");
     if !live.exists() {
         return Ok(BTree::new());
     }
+    let corrupt =
+        |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("btree.dat {why}"));
     let doc = std::fs::read(&live)?;
     if doc.len() < 4 + 4 {
-        return Err(std::io::Error::other("btree.dat too short"));
+        return Err(corrupt("is too short"));
     }
     let got_magic = u32::from_le_bytes([doc[0], doc[1], doc[2], doc[3]]);
     if got_magic != MAGIC {
-        return Err(std::io::Error::other("btree.dat bad magic"));
+        return Err(corrupt("has a bad magic"));
     }
     let body = &doc[4..doc.len() - 4];
     let last4 = [
@@ -579,16 +618,14 @@ pub fn open(dir: &Path) -> std::io::Result<BTree> {
     ];
     let got_crc = u32::from_le_bytes(last4);
     if got_crc != crc32(body) {
-        return Err(std::io::Error::other(
-            "btree.dat CRC mismatch (torn/corrupt)",
-        ));
+        return Err(corrupt("fails its CRC (torn or corrupt)"));
     }
-    match parse_page(body) {
+    match parse_page(body, 0) {
         Some(root) => {
             let len = root.count();
             Ok(BTree { root, len })
         }
-        None => Err(std::io::Error::other("btree.dat undecodable page")),
+        None => Err(corrupt("has an undecodable page")),
     }
 }
 
@@ -700,7 +737,7 @@ mod test {
         for _ in 0..50 {
             t.insert(key(), vec![b'x']);
         }
-        let doc = tree_document(&t.root);
+        let doc = tree_document(&t.root).unwrap();
         commit_document(&dir, &doc).unwrap();
         let mut raw = std::fs::read(dir.join("btree.dat")).unwrap();
         raw[doc.len() / 2] ^= 0x80;
@@ -876,6 +913,100 @@ mod test {
             t.range(b"\xff", b"\x00").is_empty(),
             "inverted bounds yield nothing"
         );
+    }
+
+    /// Wrap a page body as the codec does: magic, body, CRC over the body.
+    fn page(body: &[u8]) -> Vec<u8> {
+        let mut p = MAGIC.to_le_bytes().to_vec();
+        p.extend_from_slice(body);
+        p.extend_from_slice(&crc32(body).to_le_bytes());
+        p
+    }
+
+    /// An internal-node body over the given (already wrapped) child pages.
+    fn internal(keys: &[&[u8]], children: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for k in keys {
+            b.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            b.extend_from_slice(k);
+        }
+        b.extend_from_slice(&(children.len() as u32).to_le_bytes());
+        for c in children {
+            b.extend_from_slice(&(c.len() as u64).to_le_bytes());
+            b.extend_from_slice(c);
+        }
+        b
+    }
+
+    /// Regression (2026-09-26 audit): the page parser trusted its length fields once the
+    /// CRC matched, so a document that was CRC-valid but malformed -- as any buggy writer
+    /// or hand-made file can be -- panicked `open` (slice out of range, a capacity
+    /// overflow, unbounded recursion), and an internal node without children panicked the
+    /// first `get`. Every such document is now an `InvalidData` error.
+    #[test]
+    fn crc_valid_but_malformed_documents_are_rejected_not_panicked() {
+        let empty_leaf = page(&[0, 0, 0, 0, 0]);
+        let mut lying_key = vec![0u8];
+        lying_key.extend_from_slice(&1u32.to_le_bytes());
+        lying_key.extend_from_slice(&1000u32.to_le_bytes()); // a 1000-byte key, absent
+        let mut huge_count = vec![0u8];
+        huge_count.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut trailing = vec![0u8, 0, 0, 0, 0];
+        trailing.push(0xEE);
+        let mut deep = empty_leaf.clone();
+        for _ in 0..=MAX_DEPTH {
+            deep = page(&internal(&[b"k"], &[deep, empty_leaf.clone()]));
+        }
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("a key longer than the page", page(&lying_key)),
+            ("an entry count no page could hold", page(&huge_count)),
+            ("trailing bytes", page(&trailing)),
+            (
+                "an internal node with no children",
+                page(&internal(&[], &[])),
+            ),
+            (
+                "more keys than children allow",
+                page(&internal(
+                    &[b"a", b"b"],
+                    &[empty_leaf.clone(), empty_leaf.clone()],
+                )),
+            ),
+            ("nesting past the depth bound", deep),
+            ("an unknown page type", page(&[7])),
+        ];
+        for (what, root) in cases {
+            let dir = fresh_dir();
+            let mut doc = MAGIC.to_le_bytes().to_vec();
+            doc.extend_from_slice(&root);
+            doc.extend_from_slice(&crc32(&root).to_le_bytes());
+            commit_document(&dir, &doc).unwrap();
+            let err = open(&dir).expect_err(what);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{what}: {err}");
+            drop_dir(&dir);
+        }
+
+        // The same helpers build a well-formed two-leaf tree, which loads and routes.
+        let leaf = |k: &[u8]| {
+            let mut b = vec![0u8];
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            b.extend_from_slice(k);
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.push(b'v');
+            page(&b)
+        };
+        let root = page(&internal(&[b"m"], &[leaf(b"a"), leaf(b"z")]));
+        let dir = fresh_dir();
+        commit(&dir, &BTree::new()).unwrap();
+        let mut doc = MAGIC.to_le_bytes().to_vec();
+        doc.extend_from_slice(&root);
+        doc.extend_from_slice(&crc32(&root).to_le_bytes());
+        commit_document(&dir, &doc).unwrap();
+        let t = open(&dir).expect("a well-formed document loads");
+        assert_eq!((t.len(), t.get(b"z")), (2, Some(b"v".to_vec())));
+        drop_dir(&dir);
     }
 
     #[test]

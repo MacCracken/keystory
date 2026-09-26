@@ -26,9 +26,16 @@
 //!   *next* checkpoint, so recovery can fall back to it with a complete log.
 //!
 //! On `open`, recovery is *snapshot + WAL tail*: load the latest usable checkpoint (O(1)
-//! in the log length), then replay only the WAL records newer than it. The WAL is
-//! reclaimed by [`Store::checkpoint`] and **never** at open: until a checkpoint
-//! re-persists it, the recovered state lives only in memory.
+//! in the log length), then replay only the WAL records newer than it, which must
+//! continue its index without a gap (a missing record is corruption, and `open` fails
+//! rather than silently losing it). The WAL is reclaimed by [`Store::checkpoint`] and
+//! **never** at open: until a checkpoint re-persists it, the recovered state lives only
+//! in memory.
+//!
+//! A store directory has one owner at a time: `open` takes an exclusive lock on its
+//! `LOCK` file (released when the `Store` is dropped, or by the OS if the process dies),
+//! so a second `open` -- in this process or another -- fails with `WouldBlock` instead
+//! of repairing the live owner's log out from under it and reusing its indices.
 //!
 //! ## What is deliberately not here (see `ROADMAP.md`)
 //! * No replication: `term` is always `1`. The Raft layer in [`crate::raft`] does not
@@ -39,7 +46,9 @@
 //!   structurally shared map would make that O(log n).
 
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -50,6 +59,9 @@ use crate::wal::{self, Record, Wal};
 
 /// Default write-ahead-log segment rotation size.
 const DEFAULT_MAX_SEG_BYTES: u64 = 1 << 20; // 1 MiB
+
+/// The lock file that makes a store directory single-owner (see the module docs).
+pub const LOCK_NAME: &str = "LOCK";
 
 /// Commit counters, for observability and tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -151,6 +163,9 @@ pub struct Store {
     commits: AtomicU64,
     wal_syncs: AtomicU64,
     checkpoints: AtomicU64,
+    /// Holds the directory's exclusive lock. Declared last so it is dropped (and the
+    /// lock released) only after the WAL is closed.
+    _lock: File,
 }
 
 impl std::fmt::Debug for Store {
@@ -174,6 +189,10 @@ impl Store {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
+        // 0) Own the directory before touching it: recovery below truncates what looks
+        //    like a torn tail, which in a live owner's log is an append in flight.
+        let lock = lock_dir(&dir)?;
+
         // 1) Fast path: load the latest usable checkpoint, if any. First boot -> None.
         let base = checkpoint::load(&dir)?;
 
@@ -182,18 +201,35 @@ impl Store {
         //    never applied; `Wal::open` below truncates it so new appends start on a
         //    clean boundary. Corruption anywhere else is an error, not something to skip.
         let (records, _torn) = wal::replay(&dir)?;
-        let (mut data, mut last_index) = match base {
+        let (mut data, base_index) = match base {
             Some(s) => (s.data, s.index),
             None => (Default::default(), 0),
         };
+        let mut last_index = base_index;
         for r in records {
-            if r.index > last_index {
-                for op in &r.ops {
-                    op.apply(&mut data, r.index);
+            if r.index <= last_index {
+                if last_index == base_index {
+                    continue; // at/below the checkpoint index: already reflected
                 }
-                last_index = r.index;
+                return Err(corrupt_log(format!(
+                    "WAL record {} follows record {last_index}: the log is out of order",
+                    r.index
+                )));
             }
-            // A record at/below the checkpoint index is already reflected; skip it.
+            // Past the checkpoint, the log must continue its index without a gap: a
+            // missing record (a lost or deleted segment) is data loss, never skippable.
+            if r.index != last_index + 1 {
+                return Err(corrupt_log(format!(
+                    "WAL is missing records {}..={} (found {} after {last_index})",
+                    last_index + 1,
+                    r.index - 1,
+                    r.index
+                )));
+            }
+            for op in &r.ops {
+                op.apply(&mut data, r.index);
+            }
+            last_index = r.index;
         }
 
         // 3) Resume the log. It is reclaimed by `checkpoint()`, never here: the recovered
@@ -222,6 +258,7 @@ impl Store {
             commits: AtomicU64::new(0),
             wal_syncs: AtomicU64::new(0),
             checkpoints: AtomicU64::new(0),
+            _lock: lock,
         })
     }
 
@@ -346,6 +383,9 @@ impl Store {
     /// flush. No thread is ever acknowledged before the `fsync` that made its ops
     /// durable.
     fn commit_ops(&self, ops: Vec<Op>) -> io::Result<u64> {
+        // Refuse ops the WAL cannot frame before they join a group: an oversized commit
+        // must fail its own caller, never the concurrent writers it would share a flush with.
+        wal::check_ops(&ops)?;
         let ticket = Arc::new(Ticket::default());
         let mut q = self.queue.lock().expect("commit queue poisoned");
         q.pending.push_back(Pending {
@@ -463,6 +503,34 @@ impl Store {
         }
         Ok(cur.index)
     }
+}
+
+/// Take the store directory's exclusive lock, returning the handle that holds it. A lock
+/// held by another `Store` fails with `WouldBlock`; on a platform without file locking
+/// the store opens unlocked rather than not at all.
+fn lock_dir(dir: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(LOCK_NAME))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "store directory {} is already open (locked by another Store)",
+                dir.display()
+            ),
+        )),
+        Err(TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => Ok(file),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// An `InvalidData` error for a log that recovery refuses to replay.
+fn corrupt_log(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
 #[cfg(test)]
@@ -653,6 +721,7 @@ mod tests {
             Some(60),
             "latest snapshot covers 60 keys"
         );
+        drop(s);
         let fresh = Store::open(d.path()).unwrap();
         assert_eq!(fresh.len(), 60, "recovered from snapshot");
         assert_eq!(fresh.stats().checkpoints, 0, "stats are per open");
@@ -909,6 +978,86 @@ mod tests {
         assert_eq!(s.index(), 25);
         assert_eq!(s.get(b"k15"), Some(b"2".to_vec()));
         assert_eq!(s.get(b"k24"), Some(b"3".to_vec()));
+    }
+
+    /// Regression (2026-09-26 audit): recovery used to apply whatever records it found
+    /// past the checkpoint, so a log missing records (a lost segment) opened "fine" with
+    /// those commits silently gone. A gap or a backwards index is now an error, while
+    /// records the checkpoint already covers may still be skipped.
+    #[test]
+    fn open_refuses_a_log_with_missing_or_reordered_records() {
+        fn write_log(dir: &Path, indices: &[u64]) {
+            let mut w = Wal::open(dir, 1 << 20).unwrap();
+            for &i in indices {
+                w.append(&Record::single(1, i, put(&format!("k{i}"), "v")))
+                    .unwrap();
+            }
+        }
+        for (name, log) in [("gap", &[1u64, 2, 7, 8][..]), ("backwards", &[1, 2, 3, 2])] {
+            let d = TmpDir::new(name);
+            write_log(d.path(), log);
+            let err = Store::open(d.path()).expect_err("a broken log must not open");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name}: {err}");
+        }
+
+        // With a checkpoint at 5, records 3 and 4 are covered; 6 must follow directly.
+        let covered = |log: &[u64]| {
+            let d = TmpDir::new("covered");
+            std::fs::create_dir_all(d.path()).unwrap();
+            let mut snap = Snapshot::empty();
+            snap.index = 5;
+            checkpoint::write(d.path(), &snap).unwrap();
+            write_log(d.path(), log);
+            Store::open(d.path()).map(|s| s.index())
+        };
+        assert_eq!(covered(&[3, 4, 6, 7]).unwrap(), 7);
+        assert!(covered(&[3, 4, 7]).is_err(), "record 6 is missing");
+    }
+
+    /// Regression (2026-09-26 audit): nothing stopped a second `Store` from opening a
+    /// live store's directory; it "repaired" the owner's log and reused its indices, so
+    /// an acknowledged write vanished at the next open. The directory is now locked.
+    #[test]
+    fn a_second_open_of_a_live_store_is_refused() {
+        let (d, s) = tmp_store("lock", 1 << 20);
+        s.put(b"k", b"v").unwrap();
+        let err = Store::open(d.path()).expect_err("the directory is owned");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        s.put(b"k2", b"v2").unwrap(); // the owner is undisturbed
+        drop(s);
+        let s = Store::open(d.path()).expect("the lock is released on drop");
+        assert_eq!(s.len(), 2);
+    }
+
+    /// A commit whose WAL append fails is not published, and a log that cannot roll the
+    /// failure back refuses later commits -- but nothing acknowledged is lost, and a
+    /// reopen recovers and resumes at the next index.
+    #[test]
+    fn a_failed_append_is_never_published_and_loses_nothing_acknowledged() {
+        let (d, s) = tmp_store("poisoned", 1 << 20);
+        for i in 0..5 {
+            s.put(format!("k{i}"), b"v").unwrap();
+        }
+        s.wal.lock().unwrap().break_for_test();
+        assert!(s.put(b"k5", b"v").is_err());
+        assert_eq!(s.get(b"k5"), None, "a failed commit is not visible");
+        let err = s
+            .put(b"k6", b"v")
+            .expect_err("the poisoned log refuses writes");
+        assert!(err.to_string().contains("reopen"), "{err}");
+        assert!(
+            s.checkpoint().is_err(),
+            "a checkpoint cannot rotate a poisoned log"
+        );
+        assert_eq!((s.len(), s.index()), (5, 5), "reads keep working");
+        drop(s);
+        let s = Store::open(d.path()).unwrap();
+        assert_eq!(
+            (s.len(), s.index()),
+            (5, 5),
+            "every acknowledged write recovered"
+        );
+        assert_eq!(s.put(b"k5", b"v").unwrap(), 6, "and the index resumes");
     }
 
     #[test]

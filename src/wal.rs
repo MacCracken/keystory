@@ -49,9 +49,19 @@
 //! bytes. The engine reclaims space with [`Wal::rotate_segment`] plus
 //! [`Wal::remove_segments_before`] (see `Store::checkpoint`); nothing else ever
 //! deletes the log.
+//!
+//! ## Failed writes
+//!
+//! A failed append (a short write, `ENOSPC`, a failed `fsync`) is rolled back: the
+//! segment is cut back to the end of its last durable record, so the next append again
+//! starts on a clean boundary and a commit index that was never acknowledged is never
+//! logged twice. If the rollback itself fails, the on-disk shape of the log is unknown
+//! and the `Wal` is *poisoned*: every later append or rotation fails until the store is
+//! reopened, where the torn-tail repair above takes over. Records that the `u32`
+//! framing cannot hold are refused with `InvalidInput` before anything is written.
 
 use std::fs::{File, OpenOptions, create_dir_all, remove_file};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::crc::crc32;
@@ -59,6 +69,9 @@ use crate::types::Op;
 
 /// Minimum payload size: any "length" smaller than this is a torn tail.
 const MIN_PAYLOAD: u32 = 1 + 8 + 8 + 4 + 4; // tag + term + index + k_len + v_len
+
+/// The largest payload the record's `u32` length field can frame, in bytes.
+pub const MAX_PAYLOAD: u64 = u32::MAX as u64;
 
 const TAG_PUT: u8 = 1;
 const TAG_DELETE: u8 = 2;
@@ -102,6 +115,9 @@ pub struct Wal {
     seg_bytes: u64,
     /// Rotation threshold.
     pub max_seg_bytes: u64,
+    /// Why the log refuses writes, once a failed append could not be rolled back (see
+    /// the module docs). `None` while the log is healthy.
+    poisoned: Option<String>,
 }
 
 impl Wal {
@@ -135,6 +151,7 @@ impl Wal {
             seg_seq: seq,
             seg_bytes,
             max_seg_bytes: max_seg_bytes.max(MIN_PAYLOAD as u64 + 8),
+            poisoned: None,
         })
     }
 
@@ -150,14 +167,22 @@ impl Wal {
     /// records are written as one contiguous buffer; a crash mid-write leaves an intact
     /// prefix of the group (each record is individually framed and checksummed), and no
     /// caller is acknowledged before the `fsync` returns.
+    ///
+    /// On failure nothing of the group stays in the log: the partial write is rolled
+    /// back (or, if that fails too, the log is poisoned -- see the module docs), so the
+    /// caller may retry the same indices. A record the framing cannot hold (no ops, or
+    /// a payload above [`MAX_PAYLOAD`]) is refused with `InvalidInput` before any write.
     pub fn append_many(&mut self, recs: &[Record]) -> io::Result<()> {
+        self.check_usable()?;
         if recs.is_empty() {
             return Ok(());
         }
         let mut buf = Vec::new();
         for rec in recs {
+            check_ops(&rec.ops)?;
             let payload = encode_payload(rec);
-            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            let len = u32::try_from(payload.len()).expect("check_ops bounds the payload");
+            buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&payload);
             buf.extend_from_slice(&crc32(&payload).to_le_bytes());
         }
@@ -166,10 +191,52 @@ impl Wal {
         if self.seg_bytes + buf.len() as u64 > self.max_seg_bytes && self.seg_bytes > 0 {
             self.rotate_segment()?;
         }
-        self.file.write_all(&buf)?;
-        self.file.sync_all()?; // fsync -> durable
+        // fsync -> durable. A failure may leave part (or all) of `buf` in the file.
+        if let Err(e) = self
+            .file
+            .write_all(&buf)
+            .and_then(|()| self.file.sync_all())
+        {
+            self.roll_back(&e);
+            return Err(e);
+        }
         self.seg_bytes += buf.len() as u64;
         Ok(())
+    }
+
+    /// Undo a failed append: cut the segment back to the end of its last durable record,
+    /// so the next append starts on a clean boundary and a retried index is never logged
+    /// twice. If the cut itself fails, the log's on-disk shape is unknown: poison it.
+    fn roll_back(&mut self, cause: &io::Error) {
+        let cut = self
+            .file
+            .set_len(self.seg_bytes)
+            .and_then(|()| self.file.seek(SeekFrom::Start(self.seg_bytes)))
+            .and_then(|_| self.file.sync_all());
+        if let Err(e) = cut {
+            self.poisoned = Some(format!(
+                "an append failed ({cause}) and could not be rolled back ({e})"
+            ));
+        }
+    }
+
+    /// Swap the segment handle for a read-only one, so the next append fails and so does
+    /// its rollback: the poisoning path, on demand.
+    #[cfg(test)]
+    pub(crate) fn break_for_test(&mut self) {
+        let path = segment_path(&self.dir, self.seg_seq);
+        self.file = File::open(path).expect("reopen the current segment read-only");
+    }
+
+    /// `Ok` unless an earlier failure poisoned the log.
+    fn check_usable(&self) -> io::Result<()> {
+        match &self.poisoned {
+            None => Ok(()),
+            Some(why) => Err(io::Error::other(format!(
+                "the WAL refuses writes after an earlier failure: {why}; reopen the store \
+                 to recover"
+            ))),
+        }
     }
 
     /// The sequence number of the segment currently being appended to.
@@ -180,34 +247,64 @@ impl Wal {
     /// Close the current segment and start a fresh one, returning the new segment's
     /// sequence number: every record appended from now on lives in a segment numbered
     /// at or above it. Used by checkpoints to draw a boundary in the log.
+    ///
+    /// The switch happens only once the new segment exists and its directory entry is
+    /// durable; if it cannot be created, appends continue in the current segment.
     pub fn rotate_segment(&mut self) -> io::Result<u32> {
+        self.check_usable()?;
         self.file.sync_all()?;
-        self.seg_seq += 1;
-        let path = segment_path(&self.dir, self.seg_seq);
-        self.file = OpenOptions::new()
+        let next = self.seg_seq.checked_add(1).ok_or_else(|| {
+            io::Error::other("WAL segment sequence exhausted (u32::MAX segments)")
+        })?;
+        let path = segment_path(&self.dir, next);
+        let file = match OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&path)?;
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                // No segment above the current one exists (open resumes the highest), so
+                // this only removes an empty file the failed open may have left behind.
+                let _ = remove_file(&path);
+                return Err(e);
+            }
+        };
+        // The new segment's directory entry must be durable before records land in it.
+        // If it may not be, stop: appending on in the old segment with an empty newer
+        // one beside it would make a later torn tail look like mid-log corruption.
+        if let Err(e) = fsync_dir(&self.dir) {
+            self.poisoned = Some(format!(
+                "segment {} was created but the directory could not be synced ({e})",
+                path.display()
+            ));
+            return Err(e);
+        }
+        self.file = file;
+        self.seg_seq = next;
         self.seg_bytes = 0;
-        fsync_dir(&self.dir)?; // the new segment's directory entry is durable too.
-        Ok(self.seg_seq)
+        Ok(next)
     }
 
-    /// Delete every segment numbered below `seq` (never the current one). Call only for
-    /// segments a durable checkpoint fully covers. Returns how many were removed.
+    /// Delete every segment numbered below `seq` (never the current one), oldest first,
+    /// so an interrupted call never leaves a hole in the middle of the retained log.
+    /// Call only for segments a durable checkpoint fully covers. Returns how many were
+    /// removed.
     pub fn remove_segments_before(&mut self, seq: u32) -> io::Result<usize> {
-        let mut removed = 0;
-        for p in list_segments(&self.dir)? {
-            if segment_seq(&p).is_some_and(|s| s < seq && s != self.seg_seq) {
-                remove_file(&p)?;
-                removed += 1;
-            }
+        let mut doomed: Vec<(u32, PathBuf)> = list_segments(&self.dir)?
+            .into_iter()
+            .filter_map(|p| segment_seq(&p).map(|s| (s, p)))
+            .filter(|&(s, _)| s < seq && s != self.seg_seq)
+            .collect();
+        doomed.sort();
+        for (_, p) in &doomed {
+            remove_file(p)?;
         }
-        if removed > 0 {
+        if !doomed.is_empty() {
             fsync_dir(&self.dir)?;
         }
-        Ok(removed)
+        Ok(doomed.len())
     }
 
     /// Durably flush the current on-disk state without appending a new record.
@@ -320,6 +417,44 @@ fn op_tag(op: &Op) -> u8 {
         Op::Put { .. } => TAG_PUT,
         Op::Delete { .. } => TAG_DELETE,
     }
+}
+
+/// The exact encoded payload size of a record carrying `ops` (see the layout above).
+fn payload_len(ops: &[Op]) -> u64 {
+    let body = |op: &Op| -> u64 {
+        let (k, v) = match op {
+            Op::Put { key, value } => (key.len(), value.len()),
+            Op::Delete { key } => (key.len(), 0),
+        };
+        4 + k as u64 + 4 + v as u64
+    };
+    match ops {
+        [op] => 1 + 8 + 8 + body(op),
+        ops => 1 + 8 + 8 + 4 + ops.iter().map(|op| 1 + body(op)).sum::<u64>(),
+    }
+}
+
+/// Check that one commit's ops fit a WAL record: at least one op, and a payload the
+/// `u32` length field can frame (which bounds every key, value and op count too).
+/// Anything else would be written as a record that replay cannot decode -- silently
+/// truncating the log at that point -- so it is refused with `InvalidInput` instead.
+pub fn check_ops(ops: &[Op]) -> io::Result<()> {
+    if ops.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a WAL record needs at least one op",
+        ));
+    }
+    let len = payload_len(ops);
+    if len > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "a commit of {len} encoded bytes exceeds the WAL record limit of {MAX_PAYLOAD}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `k_len, key, v_len, val` (an empty value for a delete).
@@ -441,13 +576,16 @@ fn segment_path(dir: &Path, seq: u32) -> PathBuf {
     dir.join(format!("wal-{seq:010}.log"))
 }
 
-/// The sequence number embedded in a segment file name, if it is one.
+/// The sequence number embedded in a segment file name, if it is one. Only the exact
+/// shape [`segment_path`] writes (ten ASCII digits) counts, so the lexical order the
+/// callers sort by is always the numeric append order.
 fn segment_seq(path: &Path) -> Option<u32> {
     let name = path.file_name()?.to_str()?;
-    name.strip_prefix("wal-")?
-        .strip_suffix(".log")?
-        .parse::<u32>()
-        .ok()
+    let digits = name.strip_prefix("wal-")?.strip_suffix(".log")?;
+    if digits.len() != 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u32>().ok()
 }
 
 /// Every segment file in `dir`, in no particular order (callers sort).
@@ -697,6 +835,151 @@ mod tests {
             0,
             "the current segment is never removed"
         );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Regression (2026-09-26 audit): a failed append used to leave its partial bytes in
+    /// the segment, so later acknowledged records landed after garbage and were cut off
+    /// as a "torn tail" at the next open (and a retried index was logged twice). The
+    /// rollback restores a clean boundary -- also on a rotated segment, whose handle is
+    /// not in append mode and must be re-positioned.
+    #[test]
+    fn failed_append_is_rolled_back_so_a_retried_index_is_logged_once() {
+        let d = dir("wal-rollback");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        w.append(&put(1, b"a", b"1")).unwrap();
+        for (next, rotate) in [(2u64, false), (3, true)] {
+            if rotate {
+                w.rotate_segment().unwrap();
+            }
+            let clean = w.seg_bytes;
+            // What a short write leaves behind: part of a record, never fsync'd.
+            w.file.write_all(&[0x40, 0, 0, 0, 1, 2, 3]).unwrap();
+            w.roll_back(&io::Error::other("simulated short write"));
+            assert!(
+                w.poisoned.is_none(),
+                "a successful rollback keeps the log usable"
+            );
+            let seg = segment_path(&d, w.current_segment());
+            assert_eq!(std::fs::metadata(&seg).unwrap().len(), clean, "cut back");
+            w.append(&put(next, b"k", b"retried")).unwrap();
+        }
+        let got = recs_clean(&d);
+        assert_eq!(
+            got.iter().map(|r| r.index).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "every index is logged exactly once, after intact records only"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// When even the rollback fails, the log is poisoned: appends and rotations refuse
+    /// until a reopen, whose repair leaves a clean, appendable log.
+    #[test]
+    fn a_failed_rollback_poisons_the_log_until_reopen() {
+        let d = dir("wal-poison");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        w.append(&put(1, b"a", b"1")).unwrap();
+        w.break_for_test();
+        assert!(w.append(&put(2, b"b", b"2")).is_err(), "the write fails");
+        let err = w
+            .append(&put(2, b"b", b"2"))
+            .expect_err("a poisoned log refuses appends");
+        assert!(err.to_string().contains("reopen"), "{err}");
+        assert!(w.rotate_segment().is_err(), "and rotations");
+        drop(w);
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        w.append(&put(2, b"b", b"2")).unwrap();
+        assert_eq!(recs_clean(&d), vec![put(1, b"a", b"1"), put(2, b"b", b"2")]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A rotation that cannot create its segment leaves the log exactly as it was:
+    /// appends continue in the current segment, which is still the one reported.
+    #[test]
+    fn a_failed_rotation_keeps_appending_to_the_current_segment() {
+        let d = dir("wal-rot-fail");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        w.append(&put(1, b"a", b"1")).unwrap();
+        let blocker = segment_path(&d, 2);
+        std::fs::create_dir(&blocker).unwrap(); // `open` of a directory fails, even as root
+        assert!(w.rotate_segment().is_err());
+        assert_eq!(
+            w.current_segment(),
+            1,
+            "no switch to a segment that does not exist"
+        );
+        w.append(&put(2, b"b", b"2")).unwrap();
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(recs_clean(&d), vec![put(1, b"a", b"1"), put(2, b"b", b"2")]);
+        assert_eq!(
+            w.rotate_segment().unwrap(),
+            2,
+            "the next rotation takes the number"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Regression (2026-09-26 audit): a record the `u32` framing cannot hold used to be
+    /// written with a truncated length (or, with no ops, as an undecodable batch) and
+    /// then read back as a torn tail. Now it is refused before anything is written, and
+    /// the size check agrees byte-for-byte with the encoder.
+    #[test]
+    fn records_the_framing_cannot_hold_are_refused_before_writing() {
+        let d = dir("wal-framing");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        w.append(&put(1, b"a", b"1")).unwrap();
+        let before = w.seg_bytes;
+        let empty = Record {
+            term: 1,
+            index: 2,
+            ops: vec![],
+        };
+        let err = w.append(&empty).expect_err("an empty record is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(w.seg_bytes, before, "nothing was written");
+        assert_eq!(recs_clean(&d), vec![put(1, b"a", b"1")]);
+
+        let batch = Record {
+            term: 1,
+            index: 2,
+            ops: vec![
+                Op::Put {
+                    key: b"k".to_vec(),
+                    value: vec![7; 300],
+                },
+                Op::Delete {
+                    key: b"gone".to_vec(),
+                },
+            ],
+        };
+        for rec in [
+            put(9, b"key", b"value"),
+            Record::single(1, 9, Op::Delete { key: b"x".to_vec() }),
+            batch,
+        ] {
+            assert_eq!(payload_len(&rec.ops), encode_payload(&rec).len() as u64);
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Only names `segment_path` writes count as segments: a stray `wal-1.log` or
+    /// `wal-+000000001.log` would otherwise sort out of append order.
+    #[test]
+    fn stray_files_are_not_mistaken_for_segments() {
+        let d = dir("wal-stray");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        w.append(&put(1, b"a", b"1")).unwrap();
+        for name in [
+            "wal-1.log",
+            "wal-+000000001.log",
+            "wal-00000000001.log",
+            "wal-x.log",
+        ] {
+            std::fs::write(d.join(name), b"junk").unwrap();
+        }
+        assert_eq!(list_segments(&d).unwrap().len(), 1);
+        assert_eq!(recs_clean(&d), vec![put(1, b"a", b"1")]);
         std::fs::remove_dir_all(&d).ok();
     }
 

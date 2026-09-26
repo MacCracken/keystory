@@ -64,17 +64,27 @@ impl Reactor {
     }
 
     /// Wait until `token` is readable or `timeout` elapses: `Ok(true)` on readiness,
-    /// `Ok(false)` on timeout. Events for other tokens are consumed and ignored (this is
+    /// `Ok(false)` on timeout. A timeout too large to form a deadline (`Duration::MAX`,
+    /// say) waits without one. Events for other tokens are consumed and ignored (this is
     /// a single-source demonstration reactor). An interrupted poll is retried within
     /// the same deadline.
+    ///
+    /// `mio` is edge-triggered: what is awaited is a readiness *event*, so bytes that
+    /// were already pending (and already reported) before the call do not end the wait.
     pub fn wait_readable(&mut self, token: Token, timeout: Duration) -> io::Result<bool> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout);
         loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(false);
-            }
-            match self.poller.poll(&mut self.events, Some(deadline - now)) {
+            let wait = match deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(false);
+                    }
+                    Some(deadline - now)
+                }
+                None => None,
+            };
+            match self.poller.poll(&mut self.events, wait) {
                 Ok(()) => {}
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
@@ -94,7 +104,8 @@ impl Reactor {
     /// Drive one real, non-blocking round trip: `write` on `peer`, wait for `token` to be
     /// readable, then `read` bytes off `reader`. Returns the number of bytes the
     /// non-blocking read returned. Fails with `TimedOut` if nothing arrives before the
-    /// deadline, and with `UnexpectedEof` if the peer closed instead.
+    /// deadline (none, for a timeout too large to form one), and with `UnexpectedEof` if
+    /// the peer closed instead.
     pub fn round_trip(
         &mut self,
         token: Token,
@@ -103,14 +114,16 @@ impl Reactor {
         payload: &[u8],
         timeout: Duration,
     ) -> io::Result<usize> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout);
         // 1. A real write on the peer end of the pair.
         peer.write_all(payload)?;
         // 2. Wait for *real* kernel readiness, then read. A spurious readiness event
         //    shows up as `WouldBlock` on the non-blocking read; wait again in that case.
         let mut buf = [0u8; 4096];
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.map_or(Duration::MAX, |d| {
+                d.saturating_duration_since(Instant::now())
+            });
             if remaining.is_zero() || !self.wait_readable(token, remaining)? {
                 return Err(io::Error::new(
                     ErrorKind::TimedOut,
@@ -201,6 +214,26 @@ mod test {
             .round_trip(token, &mut a, &mut reader, b"", Duration::from_millis(50))
             .expect_err("an empty write never becomes readable");
         assert_eq!(err.kind(), ErrorKind::TimedOut);
+    }
+
+    /// Regression (2026-09-26 audit): `Instant::now() + timeout` panicked for a timeout
+    /// too large to form a deadline, such as `Duration::MAX` meaning "no deadline".
+    #[test]
+    fn an_unbounded_timeout_waits_without_a_deadline() {
+        let (mut a, b) = UnixStream::pair().expect("pair");
+        let mut reader = b.try_clone().expect("clone");
+        let mut reactor = Reactor::new().expect("reactor");
+        let token = reactor.register_readable(&b).expect("register");
+        let n = reactor
+            .round_trip(token, &mut a, &mut reader, b"ping", Duration::MAX)
+            .expect("round trip with no deadline");
+        assert!(n > 0);
+        a.write_all(b"pong").expect("write");
+        assert!(
+            reactor
+                .wait_readable(token, Duration::MAX)
+                .expect("wait with no deadline")
+        );
     }
 
     /// Registration switches the stream to non-blocking mode: a read with nothing

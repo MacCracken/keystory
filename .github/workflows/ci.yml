@@ -15,14 +15,14 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo fmt --all --check
 
   clippy:
     name: clippy (-D warnings)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo clippy --all-targets -- -D warnings
 
   doc:
@@ -31,7 +31,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo doc --no-deps
 
   test:
@@ -43,6 +43,6 @@ jobs:
         # The crash tests SIGKILL a child via `kill -9`, so the suite is Unix-only.
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo test --all-targets
       - run: cargo build --release
