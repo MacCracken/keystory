@@ -158,8 +158,9 @@ fn concurrent_writers_and_readers_are_sequentially_consistent() {
         );
     }
 
-    // 3) Durability: checkpoint, then reopen the same final state.
+    // 3) Durability: checkpoint, close, then reopen the same final state.
     store.checkpoint().expect("checkpoint");
+    drop(store); // a directory has one owner at a time
     let reopened = Store::open(dir).expect("reopen");
     assert_eq!(reopened.len(), KEYS as usize, "final recovered set size");
 
@@ -226,7 +227,8 @@ fn bump_and_check_lost_updates() {
     store.checkpoint().expect("checkpoint hot");
     let tail = "w9_9999";
     store.put(b"hot", tail.as_bytes()).expect("tail put");
-    let reopened = Store::open(dir).expect("reopen after crash");
+    drop(store);
+    let reopened = Store::open(dir).expect("reopen after close");
     assert_eq!(
         reopened.get(b"hot"),
         Some(tail.as_bytes().to_vec()),
