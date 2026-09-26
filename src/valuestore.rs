@@ -10,7 +10,14 @@
 //! are live, dropping superseded ones, atomically (tmp + fsync + rename) so a crash mid-compact
 //! leaves the original log intact. Ids are **stable across compaction**: a handle stays valid,
 //! because reads resolve the id through an in-memory index (rebuilt from the log at open) rather
-//! than trusting the handle's recorded offset.
+//! than trusting the handle's recorded offset. Ids are also **never reused**: a compacted log
+//! ends with a *fence* record carrying the id high-water mark, so a reopen keeps counting past
+//! every id ever handed out even when compaction dropped the highest ones. A handle to a dropped
+//! blob therefore reads as absent -- never as some newer blob that inherited its id.
+//!
+//! **Failed writes.** A failed `put` is rolled back (the log is cut back to its last intact
+//! record) so the next append starts on a clean boundary; if the rollback fails too, the store is
+//! *poisoned* and refuses writes until it is reopened, where the torn-tail repair takes over.
 //!
 //! *Honest scope:* this is a tested primitive that the live [`crate::Store`] does **not**
 //! use yet. WAL entries and snapshot records still carry value bytes inline and the in-RAM
@@ -42,6 +49,9 @@ pub struct BlobRef {
 const REL_PATH: &str = "values/blobs";
 const REC_HDR: usize = 16; // id:8 BE + len:8 BE
 const REC_TRAIL: usize = 4; // crc32 over (header || payload)
+/// The reserved id of a *fence* record. It is never allocated to a blob; its 8-byte
+/// big-endian payload is the id high-water mark (`next_id`) when a compaction wrote it.
+const FENCE_ID: BlobId = BlobId::MAX;
 
 /// An off-heap, append-only, compactable value store rooted at `dir`.
 ///
@@ -61,6 +71,36 @@ struct Inner {
     end: u64,
     /// `id -> (offset, len)` for every record in the log, rebuilt at open.
     index: BTreeMap<BlobId, (u64, u64)>,
+    /// Why the store refuses writes, once a failed append could not be rolled back.
+    poisoned: Option<String>,
+}
+
+impl Inner {
+    /// `Ok` unless an earlier failure poisoned the store.
+    fn check_usable(&self) -> io::Result<()> {
+        match &self.poisoned {
+            None => Ok(()),
+            Some(why) => Err(io::Error::other(format!(
+                "the value store refuses writes after an earlier failure: {why}; reopen it \
+                 to recover"
+            ))),
+        }
+    }
+
+    /// Undo a failed append: cut the log back to the end of its last intact record, so
+    /// the next record starts on a clean boundary (the handle is `O_APPEND`, so the next
+    /// write lands exactly there). If the cut fails too, poison the store.
+    fn roll_back(&mut self, cause: &io::Error) {
+        if let Err(e) = self
+            .file
+            .set_len(self.end)
+            .and_then(|()| self.file.sync_all())
+        {
+            self.poisoned = Some(format!(
+                "an append failed ({cause}) and could not be rolled back ({e})"
+            ));
+        }
+    }
 }
 
 impl ValueStore {
@@ -68,57 +108,64 @@ impl ValueStore {
     /// the id index, the id counter and the end offset; a torn trailing record (a crash
     /// mid-append) is truncated away so later appends start on a clean boundary.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<ValueStore> {
-        let path = dir.as_ref().join(REL_PATH);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let root = dir.as_ref();
+        let path = root.join(REL_PATH);
+        let values_dir = path.parent().expect("REL_PATH has a parent directory");
+        let created = !path.exists();
+        fs::create_dir_all(values_dir)?;
         let file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(&path)?;
+        if created {
+            // A new log's directory entries must be as durable as the blobs put into it.
+            crate::wal::fsync_dir(values_dir)?;
+            crate::wal::fsync_dir(root)?;
+        }
         let mut index = BTreeMap::new();
+        let mut fence = 0;
         let end = scan_records(&path, |id, offset, payload| {
-            index.insert(id, (offset, payload.len() as u64));
+            if id == FENCE_ID {
+                if let Ok(mark) = <[u8; 8]>::try_from(payload) {
+                    fence = fence.max(u64::from_be_bytes(mark));
+                }
+            } else {
+                index.insert(id, (offset, payload.len() as u64));
+            }
         })?;
         if file.metadata()?.len() > end {
             file.set_len(end)?; // drop a torn tail
             file.sync_all()?;
         }
-        let next_id = index.keys().next_back().map_or(0, |id| id + 1);
+        let next_id = index.keys().next_back().map_or(0, |id| id + 1).max(fence);
         Ok(ValueStore {
             inner: Mutex::new(Inner {
                 file,
                 next_id,
                 end,
                 index,
+                poisoned: None,
             }),
             path,
         })
     }
 
     /// Append `value` durably and return its handle. The record is fsync'd *before* the id is
-    /// handed out, so a returned handle is durable.
+    /// handed out, so a returned handle is durable. A failed append leaves nothing behind.
     #[allow(clippy::should_implement_trait)]
     pub fn put(&self, value: &[u8]) -> io::Result<BlobRef> {
         let mut g = self.inner.lock().unwrap();
+        g.check_usable()?;
         let id = g.next_id;
+        if id == FENCE_ID {
+            return Err(io::Error::other("blob id space exhausted"));
+        }
         let offset = g.end;
-
-        // Record: [id:8 BE][len:8 BE][payload][crc32(header||payload):4 BE]. The CRC folds
-        // incrementally, so the value is never copied.
-        let hdr = id.to_be_bytes();
-        let lenb = (value.len() as u64).to_be_bytes();
-        let mut crc = Crc::new();
-        crc.update(&hdr);
-        crc.update(&lenb);
-        crc.update(value);
-        g.file.write_all(&hdr)?;
-        g.file.write_all(&lenb)?;
-        g.file.write_all(value)?;
-        g.file.write_all(&crc.finish().to_be_bytes())?;
-        g.file.sync_all()?;
-
+        if let Err(e) = write_record(&mut g.file, id, value).and_then(|()| g.file.sync_all()) {
+            g.roll_back(&e);
+            return Err(e);
+        }
         let len = value.len() as u64;
         g.end += (REC_HDR + REC_TRAIL) as u64 + len;
         g.next_id = id + 1;
@@ -128,8 +175,9 @@ impl ValueStore {
 
     /// Read a blob by handle, verifying its CRC. Random access: seeks to the record the index
     /// holds for `ref_to.id` and reads only its bytes. Returns `None` if the id is unknown, the
-    /// handle's length disagrees with the log, or the record is torn or corrupt. The allocation
-    /// is bounded by the indexed length, never by whatever a damaged header claims.
+    /// handle's length disagrees with the log, or the record is torn or corrupt; a genuine I/O
+    /// failure is an error, not an absence. The allocation is bounded by the indexed length,
+    /// never by whatever a damaged header claims.
     pub fn get(&self, ref_to: &BlobRef) -> io::Result<Option<Vec<u8>>> {
         let mut g = self.inner.lock().unwrap();
         let Some(&(offset, len)) = g.index.get(&ref_to.id) else {
@@ -142,7 +190,7 @@ impl ValueStore {
         // position cannot misplace a later write.
         g.file.seek(SeekFrom::Start(offset))?;
         let mut hdr = [0u8; REC_HDR];
-        if g.file.read_exact(&mut hdr).is_err() {
+        if !read_or_eof(&mut g.file, &mut hdr)? {
             return Ok(None);
         }
         let disk_id = u64::from_be_bytes(hdr[0..8].try_into().expect("8 bytes"));
@@ -151,11 +199,11 @@ impl ValueStore {
             return Ok(None); // the header on disk disagrees with the index: damaged
         }
         let mut payload = vec![0u8; len as usize];
-        if g.file.read_exact(&mut payload).is_err() {
+        if !read_or_eof(&mut g.file, &mut payload)? {
             return Ok(None);
         }
         let mut crcb = [0u8; REC_TRAIL];
-        if g.file.read_exact(&mut crcb).is_err() {
+        if !read_or_eof(&mut g.file, &mut crcb)? {
             return Ok(None);
         }
         let mut crc = Crc::new();
@@ -168,51 +216,70 @@ impl ValueStore {
     }
 
     /// Compact the log: rewrite it keeping only the blobs whose ids are in `live`, dropping
-    /// superseded ones. Ids are preserved, so every handle to a live blob stays valid. Streams
-    /// record by record (O(one record) memory), then publishes atomically (tmp, fsync, rename,
-    /// then a directory fsync); a crash mid-compaction leaves the original log intact. The
-    /// store's lock is held throughout, so no concurrent `put` can slip into the old log and
-    /// be lost. Returns the new end offset.
+    /// superseded ones. Ids are preserved, so every handle to a live blob stays valid, and the
+    /// new log ends with a fence carrying the id high-water mark, so no dropped id is ever
+    /// reused. Streams record by record (O(one record) memory), then publishes atomically (tmp,
+    /// fsync, rename, then a directory fsync); a crash mid-compaction leaves the original log
+    /// intact, and so does any error. A log damaged before its end is refused (`InvalidData`)
+    /// rather than rewritten without the live blobs past the damage. The store's lock is held
+    /// throughout, so no concurrent `put` can slip into the old log and be lost. Returns the
+    /// new end offset.
     pub fn compact(&self, live: &BTreeSet<BlobId>) -> io::Result<u64> {
         let mut g = self.inner.lock().unwrap();
+        g.check_usable()?;
         let tmp = self.path.with_extension("tmp");
         let _ = fs::remove_file(&tmp);
-        let mut out = BufWriter::new(File::create(&tmp)?);
+        // Opened for read + append up front: once the rename publishes it, this very handle
+        // becomes the store's, so nothing can fail between the old log going and the new one
+        // being usable.
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let mut out = BufWriter::new(&file);
         let mut index = BTreeMap::new();
         let mut end = 0u64;
-        scan_records(&self.path, |id, _old_offset, payload| {
-            if !live.contains(&id) {
+        let mut failed = None;
+        let scanned = scan_records(&self.path, |id, _old_offset, payload| {
+            if failed.is_some() || id == FENCE_ID || !live.contains(&id) {
                 return;
             }
-            let hdr = id.to_be_bytes();
-            let lenb = (payload.len() as u64).to_be_bytes();
-            let mut crc = Crc::new();
-            crc.update(&hdr);
-            crc.update(&lenb);
-            crc.update(payload);
-            // Writes into a BufWriter over a fresh file only fail on I/O errors, which
-            // surface at `flush`/`sync_all` below.
-            let _ = out.write_all(&hdr);
-            let _ = out.write_all(&lenb);
-            let _ = out.write_all(payload);
-            let _ = out.write_all(&crc.finish().to_be_bytes());
-            index.insert(id, (end, payload.len() as u64));
-            end += (REC_HDR + REC_TRAIL + payload.len()) as u64;
+            match write_record(&mut out, id, payload) {
+                Ok(()) => {
+                    index.insert(id, (end, payload.len() as u64));
+                    end += (REC_HDR + REC_TRAIL + payload.len()) as u64;
+                }
+                Err(e) => failed = Some(e),
+            }
         })?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        if scanned != g.end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "blob log {} is damaged at byte {scanned} of {}; refusing to compact away \
+                     the blobs after it",
+                    self.path.display(),
+                    g.end
+                ),
+            ));
+        }
+        write_record(&mut out, FENCE_ID, &g.next_id.to_be_bytes())?;
+        end += (REC_HDR + REC_TRAIL + 8) as u64;
         out.flush()?;
-        let f = out.into_inner().map_err(|e| e.into_error())?;
-        f.sync_all()?;
-        drop(f);
+        drop(out);
+        file.sync_all()?;
         fs::rename(&tmp, &self.path)?;
+        // The compacted log is the live one from here on, whatever happens next.
+        g.file = file;
+        g.index = index;
+        g.end = end;
         if let Some(dir) = self.path.parent() {
             crate::wal::fsync_dir(dir)?;
         }
-        g.file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        g.index = index;
-        g.end = end;
         Ok(end)
     }
 
@@ -235,6 +302,39 @@ impl ValueStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Swap the log handle for a read-only one, so the next append fails and so does its
+    /// rollback: the poisoning path, on demand.
+    #[cfg(test)]
+    fn break_for_test(&self) {
+        self.inner.lock().unwrap().file =
+            File::open(&self.path).expect("reopen the blob log read-only");
+    }
+}
+
+/// Write one record -- `[id:8 BE][len:8 BE][payload][crc32(header||payload):4 BE]` -- to `w`.
+/// The CRC folds incrementally, so the payload is never copied.
+fn write_record(w: &mut impl Write, id: BlobId, payload: &[u8]) -> io::Result<()> {
+    let hdr = id.to_be_bytes();
+    let lenb = (payload.len() as u64).to_be_bytes();
+    let mut crc = Crc::new();
+    crc.update(&hdr);
+    crc.update(&lenb);
+    crc.update(payload);
+    w.write_all(&hdr)?;
+    w.write_all(&lenb)?;
+    w.write_all(payload)?;
+    w.write_all(&crc.finish().to_be_bytes())
+}
+
+/// `read_exact`, except that running out of file (a torn record) is `Ok(false)` rather than
+/// an error: only a genuine I/O failure propagates.
+fn read_or_eof(r: &mut impl Read, buf: &mut [u8]) -> io::Result<bool> {
+    match r.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Walk the log at `path` record by record, handing each intact `(id, offset, payload)` to
@@ -252,11 +352,18 @@ fn scan_records(path: &Path, mut sink: impl FnMut(BlobId, u64, &[u8])) -> io::Re
         rd.read_exact(&mut hdr)?;
         let id = u64::from_be_bytes(hdr[0..8].try_into().expect("8 bytes"));
         let len = u64::from_be_bytes(hdr[8..16].try_into().expect("8 bytes"));
-        let total = (REC_HDR + REC_TRAIL) as u64 + len;
-        if pos + total > file_len {
+        // A damaged length can be anything up to `u64::MAX`: bound it with checked
+        // arithmetic, so it ends the log instead of overflowing.
+        let next = len
+            .checked_add((REC_HDR + REC_TRAIL) as u64)
+            .and_then(|total| pos.checked_add(total));
+        let (Some(next), Ok(len)) = (next, usize::try_from(len)) else {
+            return Ok(pos);
+        };
+        if next > file_len {
             return Ok(pos); // torn tail (or a damaged length): the log ends here
         }
-        let mut payload = vec![0u8; len as usize];
+        let mut payload = vec![0u8; len];
         rd.read_exact(&mut payload)?;
         let mut crcb = [0u8; REC_TRAIL];
         rd.read_exact(&mut crcb)?;
@@ -267,7 +374,7 @@ fn scan_records(path: &Path, mut sink: impl FnMut(BlobId, u64, &[u8])) -> io::Re
             return Ok(pos); // corrupt record: stop, never trust what follows
         }
         sink(id, pos, &payload);
-        pos += total;
+        pos = next;
     }
 }
 
@@ -436,6 +543,139 @@ mod test {
         let v2 = ValueStore::open(t.root()).unwrap();
         assert_eq!(v2.get(&b).unwrap(), Some(b"second".to_vec()));
         assert_eq!(v2.count(), 2);
+    }
+
+    /// Regression (2026-09-26 audit): `next_id` was rebuilt at open from the highest id
+    /// left in the log, so a compaction that dropped the highest blobs followed by a reopen
+    /// handed their ids out again -- and a stale handle to a dropped blob silently read the
+    /// new blob's bytes. The compacted log's fence keeps the high-water mark.
+    #[test]
+    fn ids_are_never_reused_after_compaction_and_reopen() {
+        let t = T::new();
+        let (a, b);
+        {
+            let v = ValueStore::open(t.root()).unwrap();
+            a = v.put(b"aa").unwrap();
+            b = v.put(b"bb").unwrap(); // the highest id, about to be dropped
+            v.compact(&BTreeSet::from([a.id])).unwrap();
+        }
+        let v = ValueStore::open(t.root()).unwrap();
+        assert_eq!(v.next_id(), b.id + 1, "the fence survives the reopen");
+        let c = v.put(b"cc").unwrap();
+        assert!(c.id > b.id, "a dropped id is never handed out again");
+        assert_eq!(v.get(&b).unwrap(), None, "a stale handle stays absent");
+        // Dropping everything, twice over, still leaves the mark in place.
+        v.compact(&BTreeSet::new()).unwrap();
+        v.compact(&BTreeSet::new()).unwrap();
+        drop(v);
+        let v = ValueStore::open(t.root()).unwrap();
+        assert_eq!((v.count(), v.next_id()), (0, c.id + 1));
+    }
+
+    /// Regression (2026-09-26 audit): a failed `put` left its partial record in the log,
+    /// so the next put was indexed at the wrong offset (unreadable at once) and the partial
+    /// record cut every later blob off at the next open. The rollback prevents both.
+    #[test]
+    fn a_failed_put_is_rolled_back_and_later_blobs_survive() {
+        let t = T::new();
+        let v = ValueStore::open(t.root()).unwrap();
+        let a = v.put(b"first").unwrap();
+        {
+            // What a short write leaves behind, then the rollback a failed put runs.
+            let mut g = v.inner.lock().unwrap();
+            g.file.write_all(&[0xAB; 11]).unwrap();
+            g.roll_back(&io::Error::other("simulated short write"));
+            assert!(g.poisoned.is_none());
+        }
+        let b = v.put(b"second").unwrap();
+        assert_eq!(
+            v.get(&b).unwrap(),
+            Some(b"second".to_vec()),
+            "readable at once"
+        );
+        drop(v);
+        let v = ValueStore::open(t.root()).unwrap();
+        assert_eq!(v.get(&a).unwrap(), Some(b"first".to_vec()));
+        assert_eq!(
+            v.get(&b).unwrap(),
+            Some(b"second".to_vec()),
+            "and after a reopen"
+        );
+    }
+
+    /// When the rollback fails as well, the store is poisoned: puts and compactions refuse,
+    /// reads go on, and a reopen recovers every acknowledged blob.
+    #[test]
+    fn a_failed_rollback_poisons_the_store_until_reopen() {
+        let t = T::new();
+        let v = ValueStore::open(t.root()).unwrap();
+        let a = v.put(b"first").unwrap();
+        v.break_for_test();
+        assert!(v.put(b"lost").is_err());
+        let err = v.put(b"refused").expect_err("poisoned");
+        assert!(err.to_string().contains("reopen"), "{err}");
+        assert!(v.compact(&BTreeSet::from([a.id])).is_err());
+        assert_eq!(v.get(&a).unwrap(), Some(b"first".to_vec()), "reads go on");
+        drop(v);
+        let v = ValueStore::open(t.root()).unwrap();
+        assert_eq!(v.count(), 1);
+        let b = v.put(b"second").unwrap();
+        assert_eq!(b.id, a.id + 1);
+    }
+
+    /// Regression (2026-09-26 audit): compaction scanned only up to the first damaged
+    /// record, so live blobs after it were silently dropped from the rewritten log. A log
+    /// damaged before its end is now refused, and left as it was.
+    #[test]
+    fn compaction_refuses_a_damaged_log_instead_of_dropping_live_blobs() {
+        let t = T::new();
+        let v = ValueStore::open(t.root()).unwrap();
+        let a = v.put(b"aaaa").unwrap();
+        let b = v.put(b"bbbb").unwrap();
+        let c = v.put(b"cccc").unwrap();
+        let mut bytes = std::fs::read(v.path()).unwrap();
+        bytes[b.offset as usize + REC_HDR] ^= 0xFF; // flip a byte of b's payload
+        std::fs::write(v.path(), &bytes).unwrap();
+        let err = v
+            .compact(&BTreeSet::from([a.id, b.id, c.id]))
+            .expect_err("damage before the end of the log");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read(v.path()).unwrap(),
+            bytes,
+            "the log is untouched"
+        );
+        assert_eq!(
+            v.get(&c).unwrap(),
+            Some(b"cccc".to_vec()),
+            "c is still there"
+        );
+    }
+
+    /// Regression (2026-09-26 audit): a length field of all ones (erased or damaged media)
+    /// overflowed the bounds arithmetic at open -- a panic in debug builds, a wrapped
+    /// bound and a huge allocation in release. It now simply ends the intact log.
+    #[test]
+    fn an_all_ones_length_ends_the_log_instead_of_overflowing() {
+        let t = T::new();
+        let a;
+        {
+            let v = ValueStore::open(t.root()).unwrap();
+            a = v.put(b"kept").unwrap();
+        }
+        let path = t.root().join(REL_PATH);
+        let clean = std::fs::metadata(&path).unwrap().len();
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0xFF; REC_HDR + REC_TRAIL + 8]).unwrap();
+        }
+        let v = ValueStore::open(t.root()).expect("open survives the damaged header");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            clean,
+            "torn tail cut"
+        );
+        assert_eq!(v.get(&a).unwrap(), Some(b"kept".to_vec()));
     }
 
     /// A damaged length header must not drive the allocation: the read is bounded by the
