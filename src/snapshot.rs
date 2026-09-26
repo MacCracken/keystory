@@ -151,39 +151,60 @@ pub fn write_streaming(dir: impl AsRef<Path>, snap: &Snapshot) -> io::Result<()>
 }
 
 /// Serialise a snapshot to its on-disk body (header + entries, no CRC).
+///
+/// # Panics
+///
+/// If a key or value is longer than `u32::MAX` bytes, which the format cannot frame.
+/// A [`crate::Store`] never holds one: its WAL refuses such a commit.
 pub fn encode(snap: &Snapshot) -> Vec<u8> {
     let mut b = Vec::new();
     let mut crc = Crc::new();
-    write_body(snap, &mut b, &mut crc).expect("writing to a Vec cannot fail");
+    write_body(snap, &mut b, &mut crc).expect("keys and values fit the u32 framing");
     b
 }
 
 /// The single definition of the body layout: header, then one record per entry in key
 /// order. Every byte goes through `sink` and into `crc`, so the buffered ([`encode`]) and
-/// streaming ([`write()`]) paths cannot drift apart.
+/// streaming ([`write()`]) paths cannot drift apart. A key or value too long for its
+/// `u32` length field is refused with `InvalidInput` rather than written with a
+/// truncated length, which would decode (CRC and all) as a different map.
 fn write_body<W: Write>(snap: &Snapshot, sink: &mut W, crc: &mut Crc) -> io::Result<()> {
     let mut emit = |bytes: &[u8]| -> io::Result<()> {
         crc.update(bytes);
         sink.write_all(bytes)
+    };
+    let len32 = |len: usize| {
+        u32::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a {len}-byte key or value exceeds the checkpoint's u32 framing"),
+            )
+        })
     };
     emit(MAGIC)?;
     emit(&FORMAT.to_le_bytes())?;
     emit(&snap.index.to_le_bytes())?;
     emit(&(snap.data.len() as u64).to_le_bytes())?;
     for (k, e) in &snap.data {
-        emit(&(k.len() as u32).to_le_bytes())?;
+        emit(&len32(k.len())?.to_le_bytes())?;
         emit(k)?;
-        emit(&(e.value.len() as u32).to_le_bytes())?;
+        emit(&len32(e.value.len())?.to_le_bytes())?;
         emit(&e.value)?;
         emit(&e.version.to_le_bytes())?;
     }
     Ok(())
 }
 
+/// The fixed header before the first entry: magic, version, index, count.
+const HEADER_LEN: usize = 4 + 4 + 8 + 8;
+/// The smallest encoded entry: an empty key and value (two `u32` lengths) and a version.
+const MIN_ENTRY_LEN: usize = 4 + 4 + 8;
+
 /// Parse the on-disk format. Verifies magic, version, count, and CRC; every read is
-/// bounded so a truncated/corrupt file yields an error rather than a panic.
+/// bounded so a truncated/corrupt file yields an error rather than a panic. The body
+/// must hold exactly `count` entries of distinct keys and nothing after them.
 pub fn decode(bytes: &[u8]) -> Result<Snapshot, Box<dyn std::error::Error + Send + Sync>> {
-    if bytes.len() < 4 + 4 + 8 + 8 + 4 {
+    if bytes.len() < HEADER_LEN + 4 {
         return Err("snapshot too short for header + crc".into());
     }
     if &bytes[..4] != MAGIC {
@@ -195,10 +216,6 @@ pub fn decode(bytes: &[u8]) -> Result<Snapshot, Box<dyn std::error::Error + Send
     }
     let index = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
     let count = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    if count > 50_000_000 {
-        // Defensive bound: a corrupt/implausibly huge count must never OOM us.
-        return Err(format!("implausible entry count {count}").into());
-    }
 
     // Trailing crc covers bytes[..len-4]; the last 4 bytes are its value.
     let stored = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
@@ -206,8 +223,13 @@ pub fn decode(bytes: &[u8]) -> Result<Snapshot, Box<dyn std::error::Error + Send
     if crc32(body) != stored {
         return Err("crc mismatch: truncated or corrupt checkpoint".into());
     }
+    // The count can be no larger than the body has room for. This is the only bound
+    // on it: a fixed cap would make a legitimately large store impossible to reopen.
+    if count > ((body.len() - HEADER_LEN) / MIN_ENTRY_LEN) as u64 {
+        return Err(format!("entry count {count} exceeds what the body can hold").into());
+    }
 
-    let mut pos = 24usize;
+    let mut pos = HEADER_LEN;
     let mut data: BTreeMap<Shared, Entry> = BTreeMap::new();
     for _ in 0..count {
         if pos + 4 > body.len() {
@@ -235,8 +257,12 @@ pub fn decode(bytes: &[u8]) -> Result<Snapshot, Box<dyn std::error::Error + Send
         }
         let version = u64::from_le_bytes(body[pos..pos + 8].try_into().unwrap());
         pos += 8;
-        let inserted = data.insert(key, Entry { value, version });
-        debug_assert!(inserted.is_none(), "BTreeMap keys are unique/ordered");
+        if data.insert(key, Entry { value, version }).is_some() {
+            return Err("corrupt entry: duplicate key".into());
+        }
+    }
+    if pos != body.len() {
+        return Err(format!("{} trailing bytes after the last entry", body.len() - pos).into());
     }
     Ok(Snapshot { index, data })
 }
@@ -393,6 +419,64 @@ mod tests {
             "no usable generation left: an error, not an empty store"
         );
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A body with a valid CRC, for crafting checkpoints the writer would never produce.
+    fn with_crc(mut body: Vec<u8>) -> Vec<u8> {
+        let crc = crc32(&body);
+        body.extend_from_slice(&crc.to_le_bytes());
+        body
+    }
+
+    /// Overwrite the header's entry count.
+    fn set_count(body: &mut [u8], count: u64) {
+        body[16..24].copy_from_slice(&count.to_le_bytes());
+    }
+
+    /// Regression (2026-09-26 audit): `decode` refused any checkpoint of more than 50
+    /// million entries, so a store that grew past that could checkpoint but never reopen.
+    /// The count is now bounded by what the body can physically hold -- which still stops
+    /// a bogus count cold, without capping a legitimate one.
+    #[test]
+    fn entry_count_is_bounded_by_the_body_not_a_fixed_cap() {
+        let mut s = Snapshot::empty();
+        fill(&mut s, 1000);
+        s.index = 1000;
+        assert_eq!(decode(&with_crc(encode(&s))).unwrap(), s);
+
+        // One entry too many: within the size bound, so the entry parser runs out of bytes.
+        let mut body = encode(&s);
+        set_count(&mut body, 1001);
+        let err = decode(&with_crc(body)).expect_err("one entry is missing");
+        assert!(err.to_string().contains("corrupt entry"), "{err}");
+        // Counts no body this size could hold are refused before any parsing.
+        for bogus in [50_000_001, u64::MAX] {
+            let mut body = encode(&s);
+            set_count(&mut body, bogus);
+            let err = decode(&with_crc(body)).expect_err("more entries than bytes");
+            assert!(err.to_string().contains("count"), "{bogus}: {err}");
+        }
+    }
+
+    /// A CRC-valid body must still be exactly `count` distinct entries: trailing bytes
+    /// or a repeated key mean the writer was not ours (or was broken), never a map to trust.
+    #[test]
+    fn trailing_bytes_and_duplicate_keys_are_rejected() {
+        let mut s = Snapshot::empty();
+        fill(&mut s, 3);
+        let mut body = encode(&s);
+        body.extend_from_slice(&[0; 20]);
+        let err = decode(&with_crc(body)).expect_err("trailing bytes");
+        assert!(err.to_string().contains("trailing"), "{err}");
+
+        let mut one = Snapshot::empty();
+        fill(&mut one, 1);
+        let mut body = encode(&one);
+        let entry = body[HEADER_LEN..].to_vec();
+        body.extend_from_slice(&entry); // the same key twice
+        set_count(&mut body, 2);
+        let err = decode(&with_crc(body)).expect_err("duplicate key");
+        assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
     /// A large snapshot streamed through the writer decodes back to the identical map,
