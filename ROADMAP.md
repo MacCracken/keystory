@@ -6,23 +6,30 @@ backlog, the design decisions in force, and a condensed history of how each phas
 here. The guiding principle since Phase 1: be **honest** — say what a test proves, what
 is merely built, and what is not there.
 
-## Status at handoff (2026-09-12)
+## Status at handoff (2026-09-26)
 
 **What exists.** A single-node engine (`Store`) with an `fsync`'d segmented WAL, group
 commit, atomic multi-op batches, RCU snapshot reads, and streamed checkpoints that keep
 one previous generation; an offline linearisability checker; a Raft state machine with
 an in-process synchronous cluster driver and an `async fn` facade; a cooperative
 single-threaded runtime; a `mio` reactor; a standalone B+ tree; an off-heap value store.
-One external dependency (`mio`). Edition 2024 on the latest stable Rust, pinned in
-`rust-toolchain.toml`. All of it is documented per module with its honest scope.
+One external dependency (`mio`). Edition 2024 on the latest stable Rust (1.98.1), pinned
+in `rust-toolchain.toml`. All of it is documented per module with its honest scope.
 
-**What the tests prove** (116 tests, all green under `-D warnings`):
+**What the tests prove** (135 tests, all green under `-D warnings`):
 
 - Durability under a real `kill -9`, including one delivered mid-write: recovery yields a
   contiguous prefix of the writes and the repaired log keeps accepting and replaying.
 - Checkpoint + WAL-tail recovery; a torn tail is truncated at open; corruption in a
   non-final segment is refused rather than skipped; a corrupt latest checkpoint falls
-  back to the retained previous one plus the WAL kept since it.
+  back to the retained previous one plus the WAL kept since it; a log with missing or
+  out-of-order records past the checkpoint is refused rather than opened short.
+- Failed writes: a failed WAL append is rolled back, so a retried index is logged once
+  and later acknowledged writes survive a reopen; if the rollback fails too, the log is
+  poisoned (writes refused, reads served) until a reopen recovers everything
+  acknowledged. Records the `u32` framing cannot hold are refused before any write.
+- One owner per store directory: a second `open`, in this process or another, is refused
+  while the first `Store` lives.
 - Sequential consistency under 8 writers and 6 paced readers for the whole run, and
   lost-update-free interleaved writers on one hot key, checked offline against the
   commit order.
@@ -31,10 +38,20 @@ One external dependency (`mio`). Edition 2024 on the latest stable Rust, pinned 
 - Checkpoints running concurrently with writers and with each other lose nothing.
 - Raft: majority election, log matching, idempotent redelivery, conflicting-entry
   replacement, vote persistence across heartbeats, a sticky leader, no minority commit,
-  failover without a lost update, and revive-then-read catching the node up.
+  failover without a lost update, and revive-then-read catching the node up. A follower
+  commits only the prefix an `AppendEntries` actually checked, and a follower whose log
+  is longer than the leader's but stale is repaired rather than counted as an ack.
 - Runtime: by-value `wake` releases its data, finished slots are reused without stale
   wakers reaching a new occupant, tasks can spawn tasks. Reactor: deadlines are honoured
-  and registered sockets are non-blocking. Epoch RCU is shareable across threads.
+  (an unbounded one included) and registered sockets are non-blocking. Epoch RCU is
+  shareable across threads.
+- Value store: ids survive compaction *and* a reopen without ever being reused; a failed
+  put is rolled back (or poisons the store); compaction refuses a log damaged before its
+  end instead of dropping the live blobs after the damage.
+- Decoders: CRC-valid but malformed snapshot bodies (bogus counts, trailing bytes,
+  duplicate keys) and B+ tree documents (lying lengths, childless or mis-shaped nodes,
+  runaway nesting) are rejected with `InvalidData`, never a panic; a snapshot's entry
+  count is bounded by its size, not a fixed cap.
 
 **Measured on the development machine** (Apple silicon, macOS, whose `fsync` is a full
 flush):
@@ -50,8 +67,10 @@ flush):
 no network transport and no election timer; the runtime and the reactor are not
 connected; the snapshot map is still cloned whole per commit (O(entries)); the B+ tree
 does not rebalance on delete and the value store is not wired into the WAL or snapshot
-formats; there are no size limits beyond the `u32` framing, no configuration surface, no
-logging or metrics beyond `Store::stats`.
+formats; the only size limit is the `u32` record framing (enforced: an oversized commit is
+refused with `InvalidInput`); there is no configuration surface and no logging or metrics
+beyond `Store::stats`. Failure paths are tested by forcing failures in-process; a real
+`ENOSPC` was reproduced only by hand, on a tiny `tmpfs` (backlog item 8).
 
 **Verify a checkout with:**
 
@@ -85,7 +104,7 @@ CI (`.github/workflows/ci.yml`) runs the same on Linux and macOS.
 | 3 | Storage I/O: shared CRC, off-heap values, streamed snapshots | **DONE** |
 | 4 | Cooperative async runtime + async facade | **DONE** |
 | 5 | B+ tree, epoch RCU model, `mio` reactor, toolchain pin | **DONE** |
-| 6 | Review and consolidation (2026-09-11/12) | **DONE** |
+| 6 | Review and consolidation (2026-09-11/12; audit addendum 2026-09-26) | **DONE** |
 | 7 | Replication on the durable engine, transport, and the remaining design gaps | **planned** |
 
 **DONE** = compiles, tests green, module docs and this file updated, approval given.
@@ -109,12 +128,15 @@ CI (`.github/workflows/ci.yml`) runs the same on Linux and macOS.
    the primary index once (4) is designed.
 6. **Value-store integration.** Carry a `BlobRef` in WAL and snapshot records for values
    above a threshold; the store's ids are already stable across compaction.
-7. **Operational hardening.** Key/value size limits (framing is `u32` today), a
-   configuration surface (segment size, checkpoint policy), background checkpointing,
-   logging/metrics hooks, and a Windows-capable crash harness.
+7. **Operational hardening.** Configurable key/value size limits (today only the `u32`
+   framing bounds them, now enforced), a configuration surface (segment size, checkpoint
+   policy), background checkpointing, logging/metrics hooks, and a Windows-capable crash
+   harness.
 8. **Testing depth.** Property-based decoders for the WAL, snapshot and B+ tree formats
    (the tests already use hand-rolled xorshift generators), a fault-injecting filesystem
-   shim for crash points inside a checkpoint, and a longer soak run in CI.
+   shim for crash points inside a checkpoint and for `ENOSPC`/`EIO` mid-append (the
+   2026-09-26 audit reproduced the WAL and value-store write-failure bugs on a 64 KiB
+   `tmpfs` by hand; CI cannot mount one), and a longer soak run in CI.
 
 ## Design decisions in force
 
@@ -134,7 +156,15 @@ Recorded so later work does not re-litigate them.
 - **WAL.** Per-record CRC; single-op records keep the Phase-1 layout, batches use tag 3.
   A torn tail is legitimate only in the last segment and is truncated at open;
   corruption elsewhere is an error. Segment creation and rotation `fsync` the directory.
-  The log is reclaimed only by checkpoints, never at open.
+  The log is reclaimed only by checkpoints, never at open. Past the checkpoint, replay
+  requires the index to continue without a gap.
+- **Failed writes.** A failed append (WAL or blob log) is rolled back to the last durable
+  record, so no unacknowledged bytes stay in the log and an index is never logged twice;
+  if the rollback fails too, the log is *poisoned* -- writes refused, reads served --
+  until a reopen, whose torn-tail repair takes over. A commit that the `u32` framing
+  cannot hold is refused before it joins a group, so it fails only its own caller.
+- **One owner per directory.** `Store::open` holds an exclusive lock on `LOCK` (std
+  `File::try_lock`) for the store's lifetime; it is taken before recovery touches the log.
 - **Checkpoints.** Streamed body, tmp + `fsync` + rename + directory `fsync`. The previous
   checkpoint is retained as `snap.prev`, and the segments it covered are deleted only by
   the *next* checkpoint, so a fall-back always has a complete log. Checkpoints exclude
@@ -146,7 +176,9 @@ Recorded so later work does not re-litigate them.
   commit, whole-cluster quorum); the transport is in-process and synchronous. A leader
   is sticky until it fails or loses its quorum; reads are leader reads that first catch
   every live follower up. The FSM keeps `votedFor` across same-term appends, skips
-  redelivered entries and replaces conflicting ones.
+  redelivered entries and replaces conflicting ones, and commits only up to the last
+  entry an `AppendEntries` covered (Raft §5.3). Catch-up always reaches the target index,
+  and only nodes whose log matches the leader's there apply the committed prefix.
 - **Dependencies and `unsafe`.** `mio` is the one dependency; `unsafe` lives only in the
   raw-waker vtable.
 - **Toolchain.** Latest stable Rust, edition 2024, pinned; no older-MSRV support.
@@ -224,6 +256,63 @@ probe tests) followed by three batches of work:
   snapshot map; group commit and atomic batches (multi-op WAL records, one `fsync` per
   group); checkpoints that no longer block writers, with a retained previous generation
   and one-generation-delayed WAL reclamation; `Store::stats`.
+
+### Phase 6 addendum — audit (2026-09-26)
+
+A second full read of every module. The toolchain was already current: 1.98.1 is the
+latest stable release, and `mio` and its dependencies were at their latest versions, so
+the only bumps were `Cargo.lock` to the v4 format and CI to `actions/checkout@v7`. Every
+suspected bug was confirmed with a throwaway probe first -- the write-failure ones against
+a real `ENOSPC` on a 64 KiB `tmpfs` -- then fixed with a named regression test:
+
+- *WAL write failures (critical):* a failed append left its partial bytes in the segment
+  and the next group reused the same indices. After one `ENOSPC`, later acknowledged and
+  `fsync`'d commits were cut off as a "torn tail" at the next open (reproduced: three
+  acknowledged writes lost). Appends now roll back or poison the log; a rotation switches
+  segments only once the new one is durable
+  (`failed_append_is_rolled_back_so_a_retried_index_is_logged_once`,
+  `a_failed_rollback_poisons_the_log_until_reopen`,
+  `a_failed_rotation_keeps_appending_to_the_current_segment`,
+  `a_failed_append_is_never_published_and_loses_nothing_acknowledged`).
+- *No directory lock:* a second `Store` on a live directory "repaired" the owner's log and
+  reused its indices, silently losing an acknowledged write
+  (`a_second_open_of_a_live_store_is_refused`).
+- *Recovery accepted gaps:* a log missing records past the checkpoint opened short
+  (`open_refuses_a_log_with_missing_or_reordered_records`).
+- *Framing overflow:* keys/values past the `u32` framing, or an empty batch, were written
+  as records replay reads as a torn tail; checkpoints could write a CRC-valid misparse
+  (`records_the_framing_cannot_hold_are_refused_before_writing`). Segment names must now
+  be the exact ten-digit form (`stray_files_are_not_mistaken_for_segments`), and old
+  segments are deleted oldest first.
+- *Snapshot decoder:* a fixed 50-million-entry cap made any larger store unopenable after
+  its first checkpoint; trailing bytes and duplicate keys were accepted
+  (`entry_count_is_bounded_by_the_body_not_a_fixed_cap`,
+  `trailing_bytes_and_duplicate_keys_are_rejected`).
+- *Raft:* a follower committed up to its own last index rather than the last entry the
+  message covered, so a stale tail could be applied
+  (`heartbeat_does_not_commit_a_stale_tail_past_the_checked_prefix`); the driver counted
+  a longer-but-stale follower log as caught up and applied it, diverging the cluster
+  (`a_longer_stale_follower_log_is_repaired_not_counted_as_an_ack`).
+- *Value store:* compaction that dropped the highest ids, then a reopen, reused them, so a
+  stale handle read another blob's bytes; a failed put made the next put unreadable and
+  lost it at reopen; compaction swallowed write errors and silently dropped live blobs
+  after a damaged record; an all-ones length overflowed at open. Fixed with a fence
+  record, rollback/poisoning, error propagation and checked arithmetic
+  (`ids_are_never_reused_after_compaction_and_reopen`,
+  `a_failed_put_is_rolled_back_and_later_blobs_survive`,
+  `a_failed_rollback_poisons_the_store_until_reopen`,
+  `compaction_refuses_a_damaged_log_instead_of_dropping_live_blobs`,
+  `an_all_ones_length_ends_the_log_instead_of_overflowing`). New logs `fsync` their
+  directory, and `get` reports real I/O errors instead of "absent".
+- *B+ tree:* a CRC-valid but malformed document panicked `open` (or the first `get`), and
+  `commit` did not `fsync` the directory after its rename
+  (`crc_valid_but_malformed_documents_are_rejected_not_panicked`).
+- *Smaller:* `Duration::MAX` panicked the reactor's deadline arithmetic
+  (`an_unbounded_timeout_waits_without_a_deadline`); `Model`'s docs were attached to a
+  private alias; stale comments in `rust-toolchain.toml` and the async driver.
+
+The `rt` tests (the only `unsafe`) also pass under Miri with strict provenance, as a
+one-off check; Miri is not in CI.
 
 ---
 
