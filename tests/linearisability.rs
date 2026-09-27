@@ -69,9 +69,10 @@ fn spawn_readers(
                     }
                     seed = xorshift(seed);
                     let key = &keys[(seed % keys.len() as u64) as usize];
-                    let (got, r_idx) = store.get_at(key);
-                    // Record the read at the snapshot index it observed.
-                    model.record_read(r_idx, key.clone(), got);
+                    // Read from one snapshot, and record the read at the index it reflects.
+                    let snap = store.snapshot();
+                    let got = snap.get(key).map(<[u8]>::to_vec);
+                    model.record_read(snap.index(), key.clone(), got);
                     thread::sleep(READ_PACE);
                 }
             })

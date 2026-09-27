@@ -5,15 +5,26 @@ edition = "2024"
 # The project targets the latest stable Rust: `rust-version` tracks the toolchain pinned
 # in rust-toolchain.toml rather than an older floor, and the crate is on edition 2024.
 rust-version = "1.98"
-description = "Crash-resilient key/value store engine: fsync'd segmented WAL, atomic checkpoints, RCU snapshot reads, an in-process Raft driver and a hand-rolled cooperative runtime."
+description = "A crash-resilient embedded key/value store: fsync'd segmented WAL, group commit, atomic batches, snapshot reads and atomic checkpoints."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/MacCracken/keystory"
+keywords = ["key-value", "database", "storage", "wal", "embedded"]
+categories = ["database-implementations"]
+exclude = [".github/"]
 
-# Dependency policy. Phases 1-4 were std-only. Phase 5 lifted that gate exactly once,
-# for real non-blocking event-driven I/O via `mio` (see src/asyncio.rs). Nothing else
-# is added: no consensus crate, no async runtime, no RPC layer, no serde.
+[features]
+# Building blocks toward replication that `Store` does not use yet: the Raft layer, the
+# cooperative runtime, the mio reactor, the B+ tree, the off-heap value store and the
+# epoch-RCU model. Tested, but with no stability promise.
+experimental = ["dep:mio"]
+
+# Dependency policy. Phases 1-4 were std-only, and so is the default build. Phase 5
+# lifted that gate exactly once, for real non-blocking event-driven I/O via `mio` (see
+# src/asyncio.rs), which only the `experimental` feature pulls in. Nothing else is added:
+# no consensus crate, no async runtime, no RPC layer, no serde.
 [dependencies]
-mio = { version = "1", features = ["os-ext"] }
+mio = { version = "1", features = ["os-ext"], optional = true }
 
 [lib]
 name = "keystory"
@@ -22,6 +33,13 @@ crate-type = ["rlib"]
 [[bin]]
 name = "keystory-crash-runner"
 path = "src/main.rs"
+
+[[test]]
+name = "replication"
+required-features = ["experimental"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [profile.release]
 # Keep full debug info in release builds so profiles and backtraces are symbolised.

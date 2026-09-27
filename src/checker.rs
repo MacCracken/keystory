@@ -23,16 +23,10 @@ use std::collections::BTreeMap;
 /// A value written by an op: either stored bytes, or "deleted/absent".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stored {
+    /// The write stored these bytes.
     Present(Vec<u8>),
+    /// The write deleted the key.
     Deleted,
-}
-
-/// A recorded write event: `(commit_index, key, value)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WriteRec {
-    pub index: u64,
-    pub key: Vec<u8>,
-    pub value: Stored,
 }
 
 /// A recorded read event: `(commit_index_of_snapshot_read, key, value_observed)`.
@@ -40,7 +34,9 @@ pub struct WriteRec {
 pub struct ReadRec {
     /// The index of the snapshot the value was read from.
     pub read_index: u64,
+    /// The key that was read.
     pub key: Vec<u8>,
+    /// The value observed: `None` for absent or deleted.
     pub value: Option<Vec<u8>>,
 }
 

@@ -26,9 +26,10 @@
 //! already serialised by the engine's commit mutex, so a brief exclusive instant on the
 //! read side cannot meaningfully serialise writers.
 //!
-//! **Open question (ROADMAP #3):** swap the cell for an epoch reclaimer (or an
-//! `arc-swap`-style atomic) to keep the *read* path contention-free under heavy churn.
-//! [`crate::epoch_rcu`] models the reclamation mechanism but is not wired in here.
+//! **Open question:** swap the cell for an epoch reclaimer (or an `arc-swap`-style
+//! atomic) to keep the *read* path contention-free under heavy churn. The `epoch_rcu`
+//! module (behind the `experimental` feature) models the reclamation mechanism but is not
+//! wired in here; `ROADMAP.md` tracks the decision under 1.0.0.
 //!
 //! We deliberately do **not** ship a "forget-per-load" scheme: that permanently
 //! increments the strong counter on every load (a silent one-ref-per-read leak)
@@ -69,7 +70,8 @@ impl<T> RcuSwap<T> {
         prev
     }
 
-    /// Number of live clones of the current value (diagnostic / tests).
+    /// Number of live clones of the current value (tests).
+    #[cfg(test)]
     pub fn live_clones(&self) -> usize {
         let guard = self.inner.read().unwrap();
         Arc::strong_count(&*guard)
