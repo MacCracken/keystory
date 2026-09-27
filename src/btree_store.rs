@@ -176,6 +176,7 @@ impl BTree {
         out
     }
 
+    /// Every entry, flattened into an ordered map (tests).
     #[cfg(test)]
     pub fn to_sorted_map(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let mut map = BTreeMap::new();
@@ -183,6 +184,7 @@ impl BTree {
         map
     }
 
+    /// Panic unless every node satisfies the B+ tree's order and fill invariants (tests).
     #[cfg(test)]
     pub fn assert_balanced(&self) {
         assert_invariants(&self.root, true);
@@ -573,7 +575,7 @@ pub fn commit(dir: &Path, tree: &BTree) -> io::Result<()> {
 /// rename, and the directory after it, so the new document is durable once this returns.
 /// Exposed so tests can exercise commit / reload without going through a `BTree`.
 pub fn commit_document(dir: &Path, doc: &[u8]) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    crate::wal::create_dir_all_durably(dir)?;
     let live = dir.join("btree.dat");
     let tmp = dir.join("btree.tmp");
     {

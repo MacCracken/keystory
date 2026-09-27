@@ -16,4 +16,4 @@ pub mod node;
 
 pub use async_driver::{get, put, run, scan};
 pub use cluster::{ClusterError, RaftCluster};
-pub use node::{Cmd, Log, LogEntry, Map, Node, NodeId, Role};
+pub use node::{Cmd, Entry, Log, LogEntry, Map, Node, NodeId, Role};

@@ -195,6 +195,30 @@ fn checkpoint_then_crash_recovers_from_snapshot_plus_tail() {
     }
 }
 
+/// The directory lock holds across processes: while the crash runner owns the store, an
+/// open from this process is refused with `WouldBlock`, and once the runner dies -- and
+/// the operating system drops its lock -- the store opens with everything it wrote.
+#[test]
+fn a_store_owned_by_another_process_is_refused_until_it_dies() {
+    let tmp = TempDir::new("cross-process-lock");
+    let dir = tmp.path();
+    let mut child = Command::new(crash_bin())
+        .arg("run")
+        .arg(dir)
+        .arg("50")
+        .spawn()
+        .expect("spawn crash-runner");
+    wait_for_done(dir, Duration::from_secs(30));
+
+    let err = keystory::Store::open(dir).expect_err("the runner owns the directory");
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock, "{err}");
+
+    force_kill(child.id());
+    let _ = child.wait();
+    let s = keystory::Store::open(dir).expect("the lock died with its owner");
+    assert_eq!(s.len(), 50, "every write the runner acknowledged");
+}
+
 /// SIGKILL the runner *while it is still writing*: the WAL may end in a torn record.
 /// Recovery must yield exactly the keys `k0..k(m-1)` for some `m >= 1` -- a prefix of
 /// the write order, nothing missing, nothing extra -- and the repaired log must keep

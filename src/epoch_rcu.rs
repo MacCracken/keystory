@@ -30,7 +30,7 @@
 //! What keeps this a *model* rather than the store's hot path is performance, not
 //! safety: the reader registry and the retirement queue sit behind mutexes, so a read
 //! takes two short lock acquisitions where a production RCU takes none. The live
-//! [`crate::rcu::RcuSwap`] (an `RwLock<Arc<_>>`) already gives readers snapshot
+//! store's `RcuSwap` (an `RwLock<Arc<_>>`) already gives readers snapshot
 //! isolation with one lock; replacing it is tracked in `ROADMAP.md`.
 //!
 //! **Observability is measured, not claimed.** A retired version is kept as a *strong*
@@ -60,6 +60,7 @@ pub struct EpochManager {
 }
 
 impl EpochManager {
+    /// A manager at epoch 0, with no reader inside a critical section and nothing retired.
     pub fn new() -> Self {
         EpochManager::default()
     }
@@ -148,6 +149,7 @@ pub struct Rcu<T: Send + Sync + 'static> {
 }
 
 impl<T: Send + Sync + 'static> Rcu<T> {
+    /// A cell whose first version is `v`.
     pub fn new(v: T) -> Self {
         Rcu {
             current: Mutex::new(Arc::new(v)),

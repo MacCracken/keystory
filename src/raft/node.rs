@@ -27,6 +27,8 @@ use crate::types::Op;
 pub type NodeId = u64;
 /// The state-machine key/value type: identical to the single-node engine's map.
 pub type Map = crate::types::Map;
+/// A value in the state machine, with the commit index that wrote it.
+pub use crate::types::Entry;
 /// A command in the replicated log. Reuses the idempotent Phase-1 op.
 pub type Cmd = Op;
 
@@ -41,11 +43,14 @@ impl Op {
 /// field reused from the Phase-1 `Record.term` (then a global, now the entry's own).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogEntry {
+    /// The term of the leader that appended this entry.
     pub self_term: u64,
+    /// The state-machine command the entry carries.
     pub cmd: Cmd,
 }
 
 impl LogEntry {
+    /// An entry carrying `cmd`, appended in `term`.
     pub fn new(term: u64, cmd: Cmd) -> Self {
         LogEntry {
             self_term: term,
@@ -54,10 +59,14 @@ impl LogEntry {
     }
 }
 
+/// A node's part in the protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
+    /// Accepts entries from a leader; the state every node starts in.
     Follower,
+    /// Asking for votes in an election it started.
     Candidate,
+    /// Won its term's election: the one node that appends new entries.
     Leader,
 }
 
@@ -69,6 +78,7 @@ pub struct Log {
 }
 
 impl Log {
+    /// An empty log.
     pub fn new() -> Self {
         Log {
             entries: Vec::new(),

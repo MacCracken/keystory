@@ -41,8 +41,11 @@ pub type BlobId = u64;
 /// `Default` (`0,0,0`) denotes "no value".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct BlobRef {
+    /// The blob's id: what a read resolves, stable across compaction and never reused.
     pub id: BlobId,
+    /// Where the blob was appended; stale after a compaction, and never trusted by reads.
     pub offset: u64,
+    /// The blob's length in bytes, checked against the log on every read.
     pub len: u64,
 }
 
@@ -112,16 +115,24 @@ impl ValueStore {
         let path = root.join(REL_PATH);
         let values_dir = path.parent().expect("REL_PATH has a parent directory");
         let created = !path.exists();
-        fs::create_dir_all(values_dir)?;
+        // Any directory created on the way is synced into its parent.
+        crate::wal::create_dir_all_durably(values_dir)?;
+        // Pin the log's path: compaction renames and syncs by path long after `open`, and
+        // a relative path would follow the process's working directory.
+        let path = std::fs::canonicalize(values_dir)?.join(
+            Path::new(REL_PATH)
+                .file_name()
+                .expect("REL_PATH names a file"),
+        );
+        let values_dir = path.parent().expect("the log lives in a directory");
         let file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(&path)?;
         if created {
-            // A new log's directory entries must be as durable as the blobs put into it.
+            // A new log's directory entry must be as durable as the blobs put into it.
             crate::wal::fsync_dir(values_dir)?;
-            crate::wal::fsync_dir(root)?;
         }
         let mut index = BTreeMap::new();
         let mut fence = 0;

@@ -2,6 +2,21 @@
 //!
 //! Append-only, `fsync`-able, segmented WAL.
 //!
+//! ## Segment layout (little-endian)
+//!
+//! ```text
+//!  offset  size  field
+//!    0      4    magic     b"KSWL"
+//!    4      4    version   u32 = 1: the record layout below
+//!    8      4    crc32     IEEE CRC-32 over bytes 0..8
+//!   12      ...  records, back to back
+//! ```
+//!
+//! Every version of the format starts with this 12-byte header, so any build can tell a
+//! segment written in another version (intact header, unknown version: refused with
+//! `Unsupported`, never read as though it were this one) from a damaged one (header CRC
+//! mismatch).
+//!
 //! ## Record layout (little-endian)
 //!
 //! ```text
@@ -37,7 +52,18 @@
 //!
 //! A torn tail is only legitimate in the **last** segment: a crash interrupts at most
 //! one append. A bad record in an earlier segment, with later segments present, is not
-//! a crash artefact but corruption, and [`replay`] refuses to skip past it.
+//! a crash artefact but corruption, and [`replay`] refuses to skip past it. Within the
+//! last segment recovery is *point-in-time*: the first record that is cut short or fails
+//! its CRC ends the log, whether a crash tore it or a later bit flip damaged it (telling
+//! the two apart is tracked in `ROADMAP.md`, under 0.3.0). A record whose CRC is valid but
+//! which does not decode is neither: no torn write produces one, so it is corruption
+//! wherever it is.
+//!
+//! A segment is born with its header written and `fsync`'d before its directory entry is
+//! synced and before any record is appended to it. A segment shorter than its header, or
+//! exactly header-sized but not a valid header, is therefore one whose creation a crash
+//! interrupted: it holds no record, [`replay`] reports a torn tail at offset 0, and
+//! [`Wal::open`] writes the header afresh. A bad header in front of records is corruption.
 //!
 //! ## Segmentation, repair, truncation
 //!
@@ -55,10 +81,13 @@
 //! A failed append (a short write, `ENOSPC`, a failed `fsync`) is rolled back: the
 //! segment is cut back to the end of its last durable record, so the next append again
 //! starts on a clean boundary and a commit index that was never acknowledged is never
-//! logged twice. If the rollback itself fails, the on-disk shape of the log is unknown
-//! and the `Wal` is *poisoned*: every later append or rotation fails until the store is
-//! reopened, where the torn-tail repair above takes over. Records that the `u32`
-//! framing cannot hold are refused with `InvalidInput` before anything is written.
+//! logged twice. A failed rotation removes the segment it half-created, so appends go on
+//! in the current segment with no newer one beside it. If a rollback or that removal
+//! fails too -- or a rotation finds the next segment's name already taken -- the on-disk
+//! shape of the log is not what the `Wal` believes, and it is *poisoned*: every later
+//! append or rotation fails until the store is reopened, where the repair above takes
+//! over. Records that the `u32` framing cannot hold are refused with `InvalidInput`
+//! before anything is written.
 
 use std::fs::{File, OpenOptions, create_dir_all, remove_file};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -67,11 +96,23 @@ use std::path::{Path, PathBuf};
 use crate::crc::crc32;
 use crate::types::Op;
 
+/// The first four bytes of every segment.
+const SEGMENT_MAGIC: [u8; 4] = *b"KSWL";
+
+/// The segment format this build writes, and the only one it reads.
+pub(crate) const SEGMENT_VERSION: u32 = 1;
+
+/// Magic, version and the header's CRC: where a segment's first record starts.
+const HEADER_LEN: u64 = 12;
+
 /// Minimum payload size: any "length" smaller than this is a torn tail.
 const MIN_PAYLOAD: u32 = 1 + 8 + 8 + 4 + 4; // tag + term + index + k_len + v_len
 
+/// The smallest whole record: length field, minimal payload, CRC.
+const MIN_RECORD: u64 = 4 + MIN_PAYLOAD as u64 + 4;
+
 /// The largest payload the record's `u32` length field can frame, in bytes.
-pub const MAX_PAYLOAD: u64 = u32::MAX as u64;
+pub(crate) const MAX_PAYLOAD: u64 = u32::MAX as u64;
 
 const TAG_PUT: u8 = 1;
 const TAG_DELETE: u8 = 2;
@@ -79,16 +120,17 @@ const TAG_BATCH: u8 = 3;
 
 /// One log record: a commit index and the ops applied at it, all-or-nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Record {
-    pub term: u64,
-    pub index: u64,
+pub(crate) struct Record {
+    pub(crate) term: u64,
+    pub(crate) index: u64,
     /// The ops of this commit. One for an ordinary put/delete; several for a batch.
-    pub ops: Vec<Op>,
+    pub(crate) ops: Vec<Op>,
 }
 
 impl Record {
     /// A single-op record.
-    pub fn single(term: u64, index: u64, op: Op) -> Record {
+    #[cfg(test)]
+    pub(crate) fn single(term: u64, index: u64, op: Op) -> Record {
         Record {
             term,
             index,
@@ -97,27 +139,36 @@ impl Record {
     }
 }
 
-/// Where [`replay`] found a torn (partial or corrupt) trailing record.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TornTail {
-    /// The segment holding the torn record.
-    pub segment: PathBuf,
-    /// Byte offset of the torn record's first byte; every byte before it is intact.
-    pub offset: u64,
+/// A point on a rotation's failure paths where a test can make I/O fail on demand.
+/// Outside tests [`Wal::fault`] is a no-op, so these cost nothing; a filesystem seam that
+/// covers every call is tracked in `ROADMAP.md` (0.3.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RotationFault {
+    /// Creating the next segment fails before anything is created.
+    Create,
+    /// Writing or syncing the next segment's header fails, after the file was created.
+    Header,
+    /// Removing that half-created segment fails too.
+    Cleanup,
+    /// Syncing the directory after creating the next segment fails.
+    DirSync,
 }
 
 /// Durable, segmented WAL rooted at a directory.
-pub struct Wal {
+pub(crate) struct Wal {
     dir: PathBuf,
     file: File,
     seg_seq: u32,
-    /// Bytes written to the current segment so far (for rotation).
+    /// Bytes in the current segment so far, header included (for rotation and rollback).
     seg_bytes: u64,
     /// Rotation threshold.
-    pub max_seg_bytes: u64,
+    max_seg_bytes: u64,
     /// Why the log refuses writes, once a failed append could not be rolled back (see
     /// the module docs). `None` while the log is healthy.
     poisoned: Option<String>,
+    /// The failure points a test has armed (see [`RotationFault`]).
+    #[cfg(test)]
+    faults: Vec<RotationFault>,
 }
 
 impl Wal {
@@ -125,9 +176,10 @@ impl Wal {
     ///
     /// Resumes the latest existing segment. If that segment ends in a torn record (a
     /// crash mid-append), the tail is truncated first, so the next append lands on a
-    /// clean boundary and a later [`replay`] sees one contiguous, intact log. Earlier
-    /// segments are left untouched for the caller to [`replay`].
-    pub fn open(dir: impl AsRef<Path>, max_seg_bytes: u64) -> io::Result<Wal> {
+    /// clean boundary and a later [`replay`] sees one contiguous, intact log; if its
+    /// header never became durable, the header is written afresh. Earlier segments are
+    /// left untouched for the caller to [`replay`].
+    pub(crate) fn open(dir: impl AsRef<Path>, max_seg_bytes: u64) -> io::Result<Wal> {
         let dir = dir.as_ref().to_path_buf();
         create_dir_all(&dir)?;
         let mut segs = list_segments(&dir)?;
@@ -136,22 +188,29 @@ impl Wal {
             Some(p) => (segment_seq(p).expect("listed segments parse"), p.clone()),
             None => (1, segment_path(&dir, 1)),
         };
-        let resumed = path.exists();
-        if resumed {
+        if path.exists() {
             repair_tail(&path)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        if !resumed {
-            fsync_dir(&dir)?; // the new segment's directory entry is durable too.
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut seg_bytes = file.metadata()?.len();
+        if seg_bytes == 0 {
+            // A new segment, or one whose creation a crash cut short: give it its header.
+            file.write_all(&segment_header())?;
+            file.sync_all()?;
+            seg_bytes = HEADER_LEN;
         }
-        let seg_bytes = file.metadata()?.len();
+        // Make the segment's directory entry durable, whether it was just created or was
+        // found after a crash that may have struck before its creator synced the directory.
+        fsync_dir(&dir)?;
         Ok(Wal {
             dir,
             file,
             seg_seq: seq,
             seg_bytes,
-            max_seg_bytes: max_seg_bytes.max(MIN_PAYLOAD as u64 + 8),
+            max_seg_bytes: max_seg_bytes.max(HEADER_LEN + MIN_RECORD),
             poisoned: None,
+            #[cfg(test)]
+            faults: Vec::new(),
         })
     }
 
@@ -159,7 +218,8 @@ impl Wal {
     ///
     /// Invariant: *after `append` returns, the record is durable and will be replayed
     /// after any crash.*
-    pub fn append(&mut self, rec: &Record) -> io::Result<()> {
+    #[cfg(test)]
+    pub(crate) fn append(&mut self, rec: &Record) -> io::Result<()> {
         self.append_many(std::slice::from_ref(rec))
     }
 
@@ -172,7 +232,7 @@ impl Wal {
     /// back (or, if that fails too, the log is poisoned -- see the module docs), so the
     /// caller may retry the same indices. A record the framing cannot hold (no ops, or
     /// a payload above [`MAX_PAYLOAD`]) is refused with `InvalidInput` before any write.
-    pub fn append_many(&mut self, recs: &[Record]) -> io::Result<()> {
+    pub(crate) fn append_many(&mut self, recs: &[Record]) -> io::Result<()> {
         self.check_usable()?;
         if recs.is_empty() {
             return Ok(());
@@ -186,9 +246,9 @@ impl Wal {
             buf.extend_from_slice(&payload);
             buf.extend_from_slice(&crc32(&payload).to_le_bytes());
         }
-        // Rotate first if this group would overflow the current segment (a group larger
-        // than a segment simply makes an oversized segment).
-        if self.seg_bytes + buf.len() as u64 > self.max_seg_bytes && self.seg_bytes > 0 {
+        // Rotate first if this group would overflow a segment that already holds records
+        // (a group larger than a segment simply makes an oversized segment).
+        if self.seg_bytes + buf.len() as u64 > self.max_seg_bytes && self.seg_bytes > HEADER_LEN {
             self.rotate_segment()?;
         }
         // fsync -> durable. A failure may leave part (or all) of `buf` in the file.
@@ -240,7 +300,7 @@ impl Wal {
     }
 
     /// The sequence number of the segment currently being appended to.
-    pub fn current_segment(&self) -> u32 {
+    pub(crate) fn current_segment(&self) -> u32 {
         self.seg_seq
     }
 
@@ -248,33 +308,68 @@ impl Wal {
     /// sequence number: every record appended from now on lives in a segment numbered
     /// at or above it. Used by checkpoints to draw a boundary in the log.
     ///
-    /// The switch happens only once the new segment exists and its directory entry is
-    /// durable; if it cannot be created, appends continue in the current segment.
-    pub fn rotate_segment(&mut self) -> io::Result<u32> {
+    /// The switch happens only once the new segment's header and directory entry are
+    /// durable. If the segment cannot be created, whatever part of it was created is
+    /// removed and appends continue in the current segment -- unless the failure leaves a
+    /// newer segment beside the current one, which poisons the log.
+    pub(crate) fn rotate_segment(&mut self) -> io::Result<u32> {
         self.check_usable()?;
         self.file.sync_all()?;
         let next = self.seg_seq.checked_add(1).ok_or_else(|| {
             io::Error::other("WAL segment sequence exhausted (u32::MAX segments)")
         })?;
         let path = segment_path(&self.dir, next);
-        let file = match OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(f) => f,
+        // Appending on in the current segment is safe only while no newer segment exists
+        // beside it: a later torn tail in a segment that is not the last looks like
+        // mid-log corruption, and recovery refuses it. Every failure below keeps to that.
+        //
+        // `create_new`: no segment above the current one should exist (open resumes the
+        // highest), and one that does must not be clobbered.
+        let created = self
+            .fault(RotationFault::Create)
+            .and_then(|()| OpenOptions::new().create_new(true).write(true).open(&path));
+        let mut file = match created {
+            Ok(file) => file,
             Err(e) => {
-                // No segment above the current one exists (open resumes the highest), so
-                // this only removes an empty file the failed open may have left behind.
-                let _ = remove_file(&path);
+                // Normally nothing was created. But the name may already be taken (a stray
+                // file, or a create that was retried after it succeeded), and then a newer
+                // segment sits beside the current one: stop.
+                if path.symlink_metadata().is_ok() {
+                    self.poisoned = Some(format!(
+                        "segment {} already exists beside the current one ({e})",
+                        path.display()
+                    ));
+                }
                 return Err(e);
             }
         };
+        if let Err(e) = self
+            .fault(RotationFault::Header)
+            .and_then(|()| file.write_all(&segment_header()))
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            // A half-born segment must not outlive the failure. If it cannot be removed
+            // durably, poison the log.
+            if let Err(cleanup) = self
+                .fault(RotationFault::Cleanup)
+                .and_then(|()| remove_file(&path))
+                .and_then(|()| fsync_dir(&self.dir))
+            {
+                self.poisoned = Some(format!(
+                    "segment {} could not be created ({e}) nor removed ({cleanup})",
+                    path.display()
+                ));
+            }
+            return Err(e);
+        }
         // The new segment's directory entry must be durable before records land in it.
         // If it may not be, stop: appending on in the old segment with an empty newer
         // one beside it would make a later torn tail look like mid-log corruption.
-        if let Err(e) = fsync_dir(&self.dir) {
+        if let Err(e) = self
+            .fault(RotationFault::DirSync)
+            .and_then(|()| fsync_dir(&self.dir))
+        {
             self.poisoned = Some(format!(
                 "segment {} was created but the directory could not be synced ({e})",
                 path.display()
@@ -283,7 +378,7 @@ impl Wal {
         }
         self.file = file;
         self.seg_seq = next;
-        self.seg_bytes = 0;
+        self.seg_bytes = HEADER_LEN;
         Ok(next)
     }
 
@@ -291,7 +386,7 @@ impl Wal {
     /// so an interrupted call never leaves a hole in the middle of the retained log.
     /// Call only for segments a durable checkpoint fully covers. Returns how many were
     /// removed.
-    pub fn remove_segments_before(&mut self, seq: u32) -> io::Result<usize> {
+    pub(crate) fn remove_segments_before(&mut self, seq: u32) -> io::Result<usize> {
         let mut doomed: Vec<(u32, PathBuf)> = list_segments(&self.dir)?
             .into_iter()
             .filter_map(|p| segment_seq(&p).map(|s| (s, p)))
@@ -307,32 +402,47 @@ impl Wal {
         Ok(doomed.len())
     }
 
-    /// Durably flush the current on-disk state without appending a new record.
-    pub fn sync(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+    /// Fail at `point` if a test armed it.
+    #[cfg(test)]
+    fn fault(&self, point: RotationFault) -> io::Result<()> {
+        if self.faults.contains(&point) {
+            return Err(io::Error::other(format!("injected failure: {point:?}")));
+        }
+        Ok(())
     }
 
-    /// Delete every segment file in this log, then start a fresh one. Call only after
-    /// a durable snapshot that fully covers their contents.
-    pub fn truncate_all(&mut self) -> io::Result<()> {
-        let boundary = self.rotate_segment()?;
-        self.remove_segments_before(boundary)?;
+    /// Outside tests no failure is ever injected.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn fault(&self, _point: RotationFault) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Arm (or, with an empty list, disarm) the failure points of [`Wal::fault`].
+    #[cfg(test)]
+    pub(crate) fn inject(&mut self, faults: &[RotationFault]) {
+        self.faults = faults.to_vec();
     }
 }
 
-/// Replay every segment in `dir` in filename (i.e. append) order.
+/// Replay every segment in `dir` in filename (i.e. append) order, handing each intact
+/// record to `sink` together with the sequence number of the segment that holds it. The
+/// sink may refuse a record by returning an error, which ends the replay with that error.
+/// Records are streamed: memory stays at one record however long the log is.
 ///
-/// Returns `(records, torn)`. A torn trailing record in the **last** segment is dropped
-/// and reported in `torn`: the records before it are complete and durable, and that is
-/// not an error. A bad record in any *earlier* segment is corruption, not a crash tail,
-/// and is returned as an `InvalidData` error rather than silently truncating history.
-pub fn replay(dir: impl AsRef<Path>) -> io::Result<(Vec<Record>, Option<TornTail>)> {
-    let mut files = list_segments(dir.as_ref())?;
+/// Returns the byte offset at which a torn tail begins in the **last** segment, if it has
+/// one: the records before it are complete and durable, and that is not an error. A bad
+/// record in any *earlier* segment is corruption, not a crash tail, and is returned as an
+/// `InvalidData` error rather than silently truncating history.
+pub(crate) fn replay(
+    dir: &Path,
+    mut sink: impl FnMut(u32, Record) -> io::Result<()>,
+) -> io::Result<Option<u64>> {
+    let mut files = list_segments(dir)?;
     files.sort();
-    let mut out = Vec::new();
     for (i, path) in files.iter().enumerate() {
-        if let Some(offset) = scan_segment(path, |r| out.push(r))? {
+        let seq = segment_seq(path).expect("listed segments parse");
+        if let Some(offset) = scan_segment(path, |r| sink(seq, r))? {
             let later = files.len() - 1 - i;
             if later > 0 {
                 return Err(io::Error::new(
@@ -344,25 +454,56 @@ pub fn replay(dir: impl AsRef<Path>) -> io::Result<(Vec<Record>, Option<TornTail
                     ),
                 ));
             }
-            return Ok((
-                out,
-                Some(TornTail {
-                    segment: path.clone(),
-                    offset,
-                }),
-            ));
+            return Ok(Some(offset));
         }
     }
-    Ok((out, None))
+    Ok(None)
 }
 
 /// Walk one segment, handing each intact record to `sink` in order. Returns the byte
-/// offset of the first torn or undecodable record, or `None` if the segment ends
-/// cleanly. Every read is bounded, so a truncated file yields an offset, not a panic.
-fn scan_segment(path: &Path, mut sink: impl FnMut(Record)) -> io::Result<Option<u64>> {
+/// offset of the first torn record -- 0 for a segment whose header never became durable --
+/// or `None` if the segment ends cleanly. Every read is bounded, so a truncated file yields
+/// an offset, not a panic.
+///
+/// Errors: a header of another format version is `Unsupported`; a bad header in front of
+/// records, or a record whose CRC is valid but which does not decode, is `InvalidData`.
+fn scan_segment(
+    path: &Path,
+    mut sink: impl FnMut(Record) -> io::Result<()>,
+) -> io::Result<Option<u64>> {
     let len = std::fs::metadata(path)?.len();
     let mut f = BufReader::new(File::open(path)?);
-    let mut pos: u64 = 0;
+    if len < HEADER_LEN {
+        return Ok(Some(0)); // a creation cut short before its header was durable
+    }
+    let mut header = [0u8; HEADER_LEN as usize];
+    f.read_exact(&mut header)?;
+    let stored_crc = u32::from_le_bytes(header[8..12].try_into().expect("4 bytes"));
+    if header[..4] != SEGMENT_MAGIC || crc32(&header[..8]) != stored_crc {
+        if len == HEADER_LEN {
+            return Ok(Some(0)); // header-sized but never a header: the same interrupted birth
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is not an intact keystory WAL segment: bad header in front of {} bytes",
+                path.display(),
+                len - HEADER_LEN
+            ),
+        ));
+    }
+    let version = u32::from_le_bytes(header[4..8].try_into().expect("4 bytes"));
+    if version != SEGMENT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "WAL segment {} has format version {version}; this build reads version \
+                 {SEGMENT_VERSION}",
+                path.display()
+            ),
+        ));
+    }
+    let mut pos = HEADER_LEN;
     loop {
         if pos + 4 > len {
             // Fewer than 4 header bytes remain: a clean end when we are exactly at
@@ -387,30 +528,52 @@ fn scan_segment(path: &Path, mut sink: impl FnMut(Record)) -> io::Result<Option<
             return Ok(Some(pos)); // crc mismatch => torn tail
         }
         match decode_payload(&pbuf) {
-            Ok(rec) => sink(rec),
-            Err(_) => return Ok(Some(pos)), // undecodable => torn tail
+            Ok(rec) => sink(rec)?,
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL segment {} holds a record at byte {pos} whose checksum is valid \
+                         but which does not decode ({e}); no torn write produces one, so \
+                         recovery refuses it rather than truncating the log there",
+                        path.display()
+                    ),
+                ));
+            }
         }
         pos += total;
     }
 }
 
-/// Truncate a torn trailing record off `path`, if there is one. Returns the offset the
-/// file was cut to, or `None` if it was already clean.
-fn repair_tail(path: &Path) -> io::Result<Option<u64>> {
-    match scan_segment(path, |_| {})? {
-        Some(off) => {
-            let f = OpenOptions::new().write(true).open(path)?;
-            f.set_len(off)?;
-            f.sync_all()?;
-            Ok(Some(off))
-        }
-        None => Ok(None),
+/// Truncate a torn trailing record off `path`, if there is one. A segment whose header
+/// never became durable is cut to zero bytes, for [`Wal::open`] to write it afresh.
+fn repair_tail(path: &Path) -> io::Result<()> {
+    if let Some(off) = scan_segment(path, |_| Ok(()))? {
+        let f = OpenOptions::new().write(true).open(path)?;
+        f.set_len(off)?;
+        f.sync_all()?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Encoding
 // ---------------------------------------------------------------------------
+
+/// The bytes every segment starts with.
+fn segment_header() -> [u8; HEADER_LEN as usize] {
+    header_for(SEGMENT_VERSION)
+}
+
+/// An intact segment header claiming `version`.
+pub(crate) fn header_for(version: u32) -> [u8; HEADER_LEN as usize] {
+    let mut header = [0u8; HEADER_LEN as usize];
+    header[..4].copy_from_slice(&SEGMENT_MAGIC);
+    header[4..8].copy_from_slice(&version.to_le_bytes());
+    let crc = crc32(&header[..8]);
+    header[8..].copy_from_slice(&crc.to_le_bytes());
+    header
+}
 
 fn op_tag(op: &Op) -> u8 {
     match op {
@@ -438,7 +601,7 @@ fn payload_len(ops: &[Op]) -> u64 {
 /// `u32` length field can frame (which bounds every key, value and op count too).
 /// Anything else would be written as a record that replay cannot decode -- silently
 /// truncating the log at that point -- so it is refused with `InvalidInput` instead.
-pub fn check_ops(ops: &[Op]) -> io::Result<()> {
+pub(crate) fn check_ops(ops: &[Op]) -> io::Result<()> {
     if ops.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -589,7 +752,7 @@ fn segment_seq(path: &Path) -> Option<u32> {
 }
 
 /// Every segment file in `dir`, in no particular order (callers sort).
-pub fn list_segments(dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn list_segments(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut vec: Vec<PathBuf> = Vec::new();
     if !dir.exists() {
         return Ok(vec);
@@ -603,10 +766,20 @@ pub fn list_segments(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(vec)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Every directory [`fsync_dir`] synced on this thread: how tests observe directory
+    /// durability, which no crash short of a power cut would otherwise reveal.
+    pub(crate) static SYNCED_DIRS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// `fsync` a directory so a just-created, renamed or deleted entry is durable: POSIX
 /// makes no promise about the entry until the directory itself is synced. A no-op on
 /// platforms where a directory cannot be opened as a file.
 pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    SYNCED_DIRS.with(|synced| synced.borrow_mut().push(dir.to_path_buf()));
     #[cfg(unix)]
     {
         File::open(dir)?.sync_all()
@@ -618,13 +791,46 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// [`create_dir_all`], then `fsync` the parent of every directory it created, outermost
+/// first, so the new entries survive a crash: a directory's existence is recorded in its
+/// parent, and POSIX promises nothing about that record until the parent is synced.
+pub(crate) fn create_dir_all_durably(dir: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.as_os_str().is_empty() || d.exists() {
+            break;
+        }
+        missing.push(d);
+        cur = d.parent();
+    }
+    create_dir_all(dir)?;
+    for d in missing.iter().rev() {
+        match d.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => fsync_dir(parent)?,
+            _ => fsync_dir(Path::new("."))?,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::Op;
 
+    /// Every record in the log plus where a torn tail begins, if anywhere.
+    fn replay_all(dir: &Path) -> io::Result<(Vec<Record>, Option<u64>)> {
+        let mut out = Vec::new();
+        let torn = replay(dir, |_, r| {
+            out.push(r);
+            Ok(())
+        })?;
+        Ok((out, torn))
+    }
+
     fn recs_clean(dir: &Path) -> Vec<Record> {
-        let (r, tail) = replay(dir).expect("replay");
+        let (r, tail) = replay_all(dir).expect("replay");
         assert!(tail.is_none(), "clean log must not report a torn tail");
         r
     }
@@ -657,6 +863,14 @@ mod tests {
         let segs = list_segments(d).unwrap();
         assert_eq!(segs.len(), 1, "expected exactly one segment, got {segs:?}");
         segs[0].clone()
+    }
+
+    /// A framed record whose CRC is valid, for payloads the encoder would never produce.
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut rec = (payload.len() as u32).to_le_bytes().to_vec();
+        rec.extend_from_slice(payload);
+        rec.extend_from_slice(&crc32(payload).to_le_bytes());
+        rec
     }
 
     #[test]
@@ -727,12 +941,11 @@ mod tests {
         let seg = only_segment(&d);
         let clean_len = std::fs::metadata(&seg).unwrap().len();
         append_junk(&seg); // simulate a torn tail: junk without fsync.
-        let (got, dropped) = replay(&d).unwrap();
+        let (got, torn) = replay_all(&d).unwrap();
         assert_eq!(got.len(), 1, "only the durable record survives");
-        let torn = dropped.expect("a torn tail must be detected");
-        assert_eq!(torn.segment, seg);
         assert_eq!(
-            torn.offset, clean_len,
+            torn,
+            Some(clean_len),
             "the tail starts where the intact records end"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -784,9 +997,9 @@ mod tests {
         assert!(segs.len() >= 2, "expected rotation");
         let first = &segs[0];
         let mut bytes = std::fs::read(first).unwrap();
-        bytes[10] ^= 0xFF; // flip a byte inside the first record's payload
+        bytes[HEADER_LEN as usize + 10] ^= 0xFF; // flip a byte inside the first record's payload
         std::fs::write(first, &bytes).unwrap();
-        let err = replay(&d).expect_err("corruption followed by later segments is an error");
+        let err = replay_all(&d).expect_err("corruption followed by later segments is an error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(&d).ok();
     }
@@ -894,23 +1107,28 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// A rotation that cannot create its segment leaves the log exactly as it was:
-    /// appends continue in the current segment, which is still the one reported.
+    /// A rotation that fails before creating anything leaves the log exactly as it was:
+    /// appends continue in the current segment, which is still the one reported, and the
+    /// next rotation takes the number.
     #[test]
-    fn a_failed_rotation_keeps_appending_to_the_current_segment() {
+    fn a_rotation_that_creates_nothing_keeps_appending_to_the_current_segment() {
         let d = dir("wal-rot-fail");
         let mut w = Wal::open(&d, 1 << 20).unwrap();
         w.append(&put(1, b"a", b"1")).unwrap();
-        let blocker = segment_path(&d, 2);
-        std::fs::create_dir(&blocker).unwrap(); // `open` of a directory fails, even as root
+        w.inject(&[RotationFault::Create]);
         assert!(w.rotate_segment().is_err());
         assert_eq!(
             w.current_segment(),
             1,
             "no switch to a segment that does not exist"
         );
+        assert!(
+            w.poisoned.is_none(),
+            "nothing was created, so nothing to clean up"
+        );
+        assert!(!segment_path(&d, 2).exists());
         w.append(&put(2, b"b", b"2")).unwrap();
-        std::fs::remove_dir(&blocker).unwrap();
+        w.inject(&[]);
         assert_eq!(recs_clean(&d), vec![put(1, b"a", b"1"), put(2, b"b", b"2")]);
         assert_eq!(
             w.rotate_segment().unwrap(),
@@ -918,6 +1136,93 @@ mod tests {
             "the next rotation takes the number"
         );
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Regression (pre-release review, second pass): a rotation that found the next
+    /// segment's name already taken failed, and appends went on in the current segment
+    /// with the newer one beside it -- so a crash tearing the current segment's tail left
+    /// a store that refused to open, every acknowledged write intact. A taken name now
+    /// poisons the log; a reopen resumes the newer segment, and nothing is lost.
+    #[test]
+    fn a_rotation_that_finds_its_segment_name_taken_poisons_the_log() {
+        let d = dir("wal-rot-taken");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        w.append(&put(1, b"a", b"1")).unwrap();
+        std::fs::write(segment_path(&d, 2), b"").unwrap(); // a stray, empty file
+        let err = w.rotate_segment().expect_err("the name is taken");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let err = w
+            .append(&put(2, b"b", b"2"))
+            .expect_err("no append beside a newer segment");
+        assert!(err.to_string().contains("already exists"), "{err}");
+        drop(w);
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        assert_eq!(w.current_segment(), 2, "the newer segment is resumed");
+        w.append(&put(2, b"b", b"2")).unwrap();
+        assert_eq!(recs_clean(&d), vec![put(1, b"a", b"1"), put(2, b"b", b"2")]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A rotation whose new segment cannot be given its header removes the half-created
+    /// file (and syncs the removal), so appends continue in the current segment with no
+    /// newer one beside it.
+    #[test]
+    fn a_rotation_whose_header_fails_removes_the_half_created_segment() {
+        let d = dir("wal-rot-header");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        w.append(&put(1, b"a", b"1")).unwrap();
+        w.inject(&[RotationFault::Header]);
+        assert!(w.rotate_segment().is_err());
+        assert!(
+            !segment_path(&d, 2).exists(),
+            "the half-created segment is gone"
+        );
+        assert!(w.poisoned.is_none());
+        assert_eq!(w.current_segment(), 1);
+        w.append(&put(2, b"b", b"2")).unwrap();
+        w.inject(&[]);
+        assert_eq!(w.rotate_segment().unwrap(), 2);
+        w.append(&put(3, b"c", b"3")).unwrap();
+        assert_eq!(
+            recs_clean(&d).iter().map(|r| r.index).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// If the half-created segment cannot be removed either, or its directory entry
+    /// cannot be synced, a newer segment may sit beside the current one: the log is
+    /// poisoned, and a reopen recovers every acknowledged record.
+    #[test]
+    fn a_rotation_that_cannot_undo_or_finish_its_segment_poisons_the_log() {
+        for (case, faults) in [
+            (
+                "cleanup",
+                &[RotationFault::Header, RotationFault::Cleanup][..],
+            ),
+            ("dir-sync", &[RotationFault::DirSync][..]),
+        ] {
+            let d = dir(&format!("wal-rot-poison-{case}"));
+            let mut w = Wal::open(&d, 1 << 20).unwrap();
+            w.append(&put(1, b"a", b"1")).unwrap();
+            w.inject(faults);
+            assert!(w.rotate_segment().is_err(), "{case}");
+            assert!(
+                segment_path(&d, 2).exists(),
+                "{case}: the newer segment remains"
+            );
+            assert!(w.poisoned.is_some(), "{case}");
+            assert!(w.append(&put(2, b"b", b"2")).is_err(), "{case}: poisoned");
+            drop(w);
+            let mut w = Wal::open(&d, 1 << 20).unwrap();
+            w.append(&put(2, b"b", b"2")).unwrap();
+            assert_eq!(
+                recs_clean(&d),
+                vec![put(1, b"a", b"1"), put(2, b"b", b"2")],
+                "{case}"
+            );
+            std::fs::remove_dir_all(&d).ok();
+        }
     }
 
     /// Regression (2026-09-26 audit): a record the `u32` framing cannot hold used to be
@@ -992,5 +1297,179 @@ mod tests {
         let mut bad = payload.clone();
         bad[4] ^= 0xFF; // flip a term byte
         assert_ne!(crc32(&payload), crc32(&bad));
+    }
+
+    /// Every segment -- the first one `open` creates and every one a rotation creates --
+    /// begins with the magic, the format version and their CRC, and nothing else is
+    /// written before its first record.
+    #[test]
+    fn every_segment_starts_with_a_versioned_header() {
+        let d = dir("wal-header");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        let first = only_segment(&d);
+        assert_eq!(std::fs::read(&first).unwrap(), segment_header());
+        let header = segment_header();
+        assert_eq!(&header[..4], b"KSWL");
+        assert_eq!(header[4..8], 1u32.to_le_bytes());
+        assert_eq!(header[8..], crc32(&header[..8]).to_le_bytes());
+        w.append(&put(1, b"a", b"1")).unwrap();
+        w.rotate_segment().unwrap();
+        w.append(&put(2, b"b", b"2")).unwrap();
+        for seg in list_segments(&d).unwrap() {
+            let bytes = std::fs::read(&seg).unwrap();
+            assert_eq!(bytes[..12], header, "{}", seg.display());
+        }
+        assert_eq!(recs_clean(&d), vec![put(1, b"a", b"1"), put(2, b"b", b"2")]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A newest segment whose header never became durable -- empty, cut short, or
+    /// header-sized but not a valid header -- is the trace of a creation a crash
+    /// interrupted: it holds no record, replay treats it as a torn tail at offset 0, and
+    /// `open` rewrites the header and keeps appending there.
+    #[test]
+    fn an_interrupted_segment_creation_is_repaired_at_open() {
+        let mut bad_crc = segment_header();
+        bad_crc[11] ^= 0x01;
+        for (case, torn) in [
+            ("empty", &b""[..]),
+            ("short", &b"KSWL\x01"[..]),
+            ("zeros", &[0u8; 12][..]),
+            ("bad-crc", &bad_crc[..]),
+        ] {
+            let d = dir(&format!("wal-born-{case}"));
+            {
+                let mut w = Wal::open(&d, 1 << 20).unwrap();
+                w.append(&put(1, b"a", b"1")).unwrap();
+            }
+            let newest = segment_path(&d, 2);
+            std::fs::write(&newest, torn).unwrap();
+            let (got, tail) = replay_all(&d).unwrap();
+            assert_eq!((got.len(), tail), (1, Some(0)), "{case}");
+            let mut w = Wal::open(&d, 1 << 20).unwrap();
+            assert_eq!(
+                w.current_segment(),
+                2,
+                "{case}: the newest segment is resumed"
+            );
+            assert_eq!(std::fs::read(&newest).unwrap(), segment_header(), "{case}");
+            w.append(&put(2, b"b", b"2")).unwrap();
+            assert_eq!(
+                recs_clean(&d),
+                vec![put(1, b"a", b"1"), put(2, b"b", b"2")],
+                "{case}"
+            );
+            std::fs::remove_dir_all(&d).ok();
+        }
+    }
+
+    /// A segment written in another format version -- an intact header naming a version
+    /// this build does not know -- is refused with `Unsupported`, by replay and by `open`,
+    /// and left exactly as it was: a store written by a newer keystory is never misread,
+    /// nor "repaired" into this version's shape. A version field damaged in place fails
+    /// the header CRC instead, and is corruption, not a newer format.
+    #[test]
+    fn a_segment_of_another_format_version_is_refused() {
+        let d = dir("wal-version");
+        {
+            let mut w = Wal::open(&d, 1 << 20).unwrap();
+            w.append(&put(1, b"a", b"1")).unwrap();
+        }
+        let seg = only_segment(&d);
+        let original = std::fs::read(&seg).unwrap();
+        let mut bytes = original.clone();
+        bytes[..12].copy_from_slice(&header_for(2));
+        std::fs::write(&seg, &bytes).unwrap();
+        let err = replay_all(&d).expect_err("an unknown version");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        let err = Wal::open(&d, 1 << 20).err().expect("open refuses it too");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        assert_eq!(
+            std::fs::read(&seg).unwrap(),
+            bytes,
+            "the segment is untouched"
+        );
+
+        let mut flipped = original;
+        flipped[4] ^= 0x02; // version 1 -> 3, in place: the header CRC no longer matches
+        std::fs::write(&seg, &flipped).unwrap();
+        let err = replay_all(&d).expect_err("a damaged version field");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A damaged header in front of records is corruption, not an interrupted creation
+    /// (a segment receives records only once its header is durable), even in the newest
+    /// segment: refused, and left as it was.
+    #[test]
+    fn a_bad_header_in_front_of_records_is_corruption() {
+        let d = dir("wal-bad-header");
+        {
+            let mut w = Wal::open(&d, 1 << 20).unwrap();
+            w.append(&put(1, b"a", b"1")).unwrap();
+        }
+        let seg = only_segment(&d);
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(&seg, &bytes).unwrap();
+        let err = replay_all(&d).expect_err("a bad header");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(Wal::open(&d, 1 << 20).is_err());
+        assert_eq!(
+            std::fs::read(&seg).unwrap(),
+            bytes,
+            "the segment is untouched"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Regression (pre-release review): a record whose CRC is valid but whose payload does
+    /// not decode (an unknown tag, say) was cut off as a torn tail, together with every
+    /// record after it. A torn write cannot produce a valid CRC, so this is corruption:
+    /// replay and `open` refuse it, and the log is not truncated.
+    #[test]
+    fn a_checksummed_record_that_does_not_decode_is_corruption_not_a_torn_tail() {
+        let d = dir("wal-undecodable");
+        {
+            let mut w = Wal::open(&d, 1 << 20).unwrap();
+            w.append(&put(1, b"a", b"1")).unwrap();
+        }
+        let seg = only_segment(&d);
+        let mut payload = vec![9u8]; // no such tag
+        payload.extend_from_slice(&1u64.to_le_bytes()); // term
+        payload.extend_from_slice(&2u64.to_le_bytes()); // index
+        payload.extend_from_slice(&[0; 8]); // k_len, v_len
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes.extend_from_slice(&framed(&payload));
+        bytes.extend_from_slice(&framed(&encode_payload(&put(3, b"c", b"3"))));
+        std::fs::write(&seg, &bytes).unwrap();
+        let err = replay_all(&d).expect_err("a valid CRC over an undecodable payload");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(Wal::open(&d, 1 << 20).is_err());
+        assert_eq!(std::fs::read(&seg).unwrap(), bytes, "nothing was truncated");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Replay hands records over one at a time and stops at the first one the sink
+    /// refuses, returning the sink's error.
+    #[test]
+    fn replay_stops_at_the_first_record_the_sink_refuses() {
+        let d = dir("wal-sink");
+        let mut w = Wal::open(&d, 1 << 20).unwrap();
+        for i in 1..=5 {
+            w.append(&put(i, b"k", b"v")).unwrap();
+        }
+        let mut seen = Vec::new();
+        let err = replay(&d, |_, r| {
+            if r.index == 3 {
+                return Err(io::Error::other("refused"));
+            }
+            seen.push(r.index);
+            Ok(())
+        })
+        .expect_err("the sink's error ends the replay");
+        assert_eq!(err.to_string(), "refused");
+        assert_eq!(seen, vec![1, 2]);
+        std::fs::remove_dir_all(&d).ok();
     }
 }

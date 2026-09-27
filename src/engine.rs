@@ -12,21 +12,22 @@
 //! * commits are **grouped**: concurrent writers queue their ops; one of them flushes
 //!   everything queued as one WAL append and one `fsync`, then publishes one snapshot
 //!   carrying all of them (each op keeps its own commit index), while the others wait
-//!   on a condvar and return as soon as their ops are durable. Throughput scales with concurrency instead of paying one `fsync` per
-//!   writer. [`Store::put_batch`] applies several ops under one index, all-or-nothing.
-//! * **reads** (`get`, `scan`, `range_scan`, `get_at`) load a frozen `Arc<Snapshot>` and
+//!   on a condvar and return as soon as their ops are durable. Throughput scales with
+//!   concurrency instead of paying one `fsync` per writer. [`Store::apply_batch`] applies
+//!   several ops under one index, all-or-nothing.
+//! * **reads** (`get`, `scan`, `range_scan`, `snapshot`) load a frozen `Arc<Snapshot>` and
 //!   never touch the commit lock, so they never block a writer and never observe a
 //!   half-updated state. A reader that loads while a commit is in flight sees either
 //!   the pre- or the post-commit snapshot -- both are legitimate points in a sequential
 //!   history, which is exactly what the Jepsen-lite checker enforces.
 //! * a **checkpoint** pins the current snapshot and rotates the WAL during an instant
 //!   of exclusivity with the flushers, then writes the snapshot file with writers
-//!   running. The previous
-//!   checkpoint is retained, and the WAL segments it covers are deleted only by the
-//!   *next* checkpoint, so recovery can fall back to it with a complete log.
+//!   running. The previous checkpoint is retained, and the WAL segments it covers are
+//!   deleted only by the *next* checkpoint, so recovery can fall back to it with a
+//!   complete log.
 //!
 //! On `open`, recovery is *snapshot + WAL tail*: load the latest usable checkpoint (O(1)
-//! in the log length), then replay only the WAL records newer than it, which must
+//! in the log length), then stream only the WAL records newer than it, which must
 //! continue its index without a gap (a missing record is corruption, and `open` fails
 //! rather than silently losing it). The WAL is reclaimed by [`Store::checkpoint`] and
 //! **never** at open: until a checkpoint re-persists it, the recovered state lives only
@@ -38,35 +39,86 @@
 //! of repairing the live owner's log out from under it and reusing its indices.
 //!
 //! ## What is deliberately not here (see `ROADMAP.md`)
-//! * No replication: `term` is always `1`. The Raft layer in [`crate::raft`] does not
-//!   yet drive this engine; it keeps its own in-memory logs and state.
-//! * No async API and no network. The cooperative runtime in [`crate::rt`] and the
-//!   `mio` reactor are not connected to the store.
+//! * No replication: every record's term is `1`. The Raft layer (the `experimental`
+//!   feature) does not yet drive this engine; it keeps its own in-memory logs and state.
+//! * No async API and no network. The cooperative runtime and the `mio` reactor (also
+//!   `experimental`) are not connected to the store.
 //! * The snapshot map is still cloned whole on every commit (O(entries)); a
 //!   structurally shared map would make that O(log n).
+//! * Nothing checkpoints automatically: the log grows until [`Store::checkpoint`] runs.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+use crate::checkpoint::{self, Replaced};
 use crate::rcu::RcuSwap;
-use crate::snapshot as checkpoint;
 use crate::types::{Op, Snapshot};
 use crate::wal::{self, Record, Wal};
 
 /// Default write-ahead-log segment rotation size.
-const DEFAULT_MAX_SEG_BYTES: u64 = 1 << 20; // 1 MiB
+const DEFAULT_WAL_SEGMENT_SIZE: u64 = 1 << 20; // 1 MiB
 
 /// The lock file that makes a store directory single-owner (see the module docs).
-pub const LOCK_NAME: &str = "LOCK";
+const LOCK_NAME: &str = "LOCK";
 
-/// Commit counters, for observability and tests.
+/// The Raft term stamped on every WAL record. A single node never holds an election, so
+/// it is always 1 until replication gives it a meaning (`ROADMAP.md`, 0.4.0).
+const SINGLE_NODE_TERM: u64 = 1;
+
+/// Settings for [`Store::open_with`].
+///
+/// The defaults suit most uses. Each setter returns the updated options, so they chain:
+///
+/// ```
+/// use keystory::{Options, Store};
+///
+/// # fn main() -> std::io::Result<()> {
+/// # let dir = std::env::temp_dir().join(format!("keystory-doc-options-{}", std::process::id()));
+/// # let _ = std::fs::remove_dir_all(&dir);
+/// let store = Store::open_with(&dir, Options::new().wal_segment_size(4 << 20))?;
+/// # drop(store);
+/// # std::fs::remove_dir_all(&dir)?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct Options {
+    wal_segment_size: u64,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            wal_segment_size: DEFAULT_WAL_SEGMENT_SIZE,
+        }
+    }
+}
+
+impl Options {
+    /// The default options.
+    pub fn new() -> Options {
+        Options::default()
+    }
+
+    /// The size in bytes past which the write-ahead log starts a new segment file
+    /// (default 1 MiB). Checkpoints reclaim the log a whole segment at a time, so smaller
+    /// segments give space back sooner, at the cost of more files. A group commit larger
+    /// than a segment makes one oversized segment rather than being split.
+    pub fn wal_segment_size(mut self, bytes: u64) -> Options {
+        self.wal_segment_size = bytes;
+        self
+    }
+}
+
+/// Commit counters since the [`Store`] was opened, for observability and tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
-    /// Commits acknowledged (one per `put`, `delete` or `put_batch` call).
+    /// Commits acknowledged (one per `put`, `delete` or `apply_batch` call).
     pub commits: u64,
     /// WAL appends, each ending in one `fsync`. `commits / wal_syncs` is the mean
     /// group size; it exceeds 1 only when writers ran concurrently.
@@ -130,20 +182,54 @@ impl Drop for FlushGuard<'_> {
 
 /// Checkpoint bookkeeping, held only by checkpoints.
 struct CheckpointState {
-    /// The WAL boundary drawn by the previous checkpoint: every record newer than the
-    /// retained `snap.prev` lives in a segment numbered at or above it. Unknown after a
-    /// restart, in which case the next checkpoint reclaims nothing (conservative).
-    prev_boundary: Option<u32>,
+    /// Where the log that the next `snap.prev` needs begins: every record newer than the
+    /// checkpoint the next checkpoint will retain as `snap.prev` lives in a segment
+    /// numbered at or above this one, so that checkpoint may delete every segment below
+    /// it. Each checkpoint's rotation draws it for the next; after a restart, recovery works
+    /// it out from where the first record the loaded checkpoint does not cover lives.
+    prev_boundary: u32,
+    /// Recovery fell back past a damaged `snap.dat`, so the next checkpoint must replace
+    /// that file rather than demote it over the good `snap.prev` (see
+    /// [`Replaced::Discard`]).
+    latest_damaged: bool,
 }
 
 /// A single-node, crash-recoverable key/value store.
 ///
-/// `Store` is `Send + Sync`: the authoritative snapshot is a `RcuSwap<Snapshot>`
-/// (interior-mutable) and the WAL and commit queue sit behind mutexes, so one `Store`
-/// may live behind an `Arc` and be shared across threads.
+/// Every write is durable when it returns: it was appended to the write-ahead log and
+/// `fsync`'d before any reader could see it. Reads never wait for writers: each is served
+/// from an immutable [`Snapshot`], and [`Store::snapshot`] hands one out to keep for many
+/// consistent reads. `Store` is `Send + Sync`; share one behind an `Arc`, and concurrent
+/// writers will share log appends and `fsync`s (group commit).
+///
+/// A directory holds one store and has one owner at a time: [`Store::open`] locks it
+/// until the `Store` is dropped (on a filesystem that cannot lock files, `open` goes ahead
+/// without the lock). The store keeps working in the directory it opened, whatever the
+/// process's working directory later becomes. The whole live dataset is held in memory.
+///
+/// # Errors
+///
+/// Every fallible method returns a [`std::io::Error`]. The kinds keystory itself reports
+/// mean:
+///
+/// | Kind | From | Meaning |
+/// |------|------|---------|
+/// | `WouldBlock` | `open` | Another `Store`, in this process or another, owns the directory. |
+/// | `InvalidData` | `open` | The files are damaged in a way recovery will not repair on its own: corruption before the tail of the last WAL segment, records missing from the middle of the log, or no usable checkpoint. The log and checkpoints are left as they were. |
+/// | `Unsupported` | `open` | A file was written in a format version this build does not read (see the crate docs). |
+/// | `InvalidInput` | writes | The commit is too large for a log record (4 GiB); nothing was written. |
+/// | `Other` | writes, `checkpoint` | The log is *poisoned*: an earlier write failed and could not be rolled back. Writes are refused until the store is reopened; reads go on, and reopening recovers every acknowledged write. |
+///
+/// Any other error is the operating system's, passed through (`StorageFull`,
+/// `PermissionDenied`, ...). A write that fails that way was not applied -- unless it
+/// also poisoned the log, in which case its outcome is unknown until the store is
+/// reopened: its records may or may not have reached the disk. An operating-system error
+/// keeps the kind the OS gave it, which can coincide with one of the kinds above (`EINVAL`
+/// is `InvalidInput`, for instance), so the kind alone does not prove which case occurred;
+/// the message does.
 pub struct Store {
     /// Store directory (snapshot + WAL segments live here).
-    dir: std::path::PathBuf,
+    dir: PathBuf,
     /// Commits waiting for a flusher, and the flush-in-progress flag (see `commit_ops`).
     queue: Mutex<CommitQueue>,
     /// Signalled whenever a flush (or a checkpoint's exclusive instant) ends: settled
@@ -154,10 +240,8 @@ pub struct Store {
     /// Write-ahead log (one append + fsync per group). Interior-mutable so `put` is
     /// `&self`.
     wal: Mutex<Wal>,
-    /// Serialises checkpoints and remembers the previous one's WAL boundary.
+    /// Serialises checkpoints and carries what one tells the next.
     ckpt: Mutex<CheckpointState>,
-    /// Current term. Always `1` on a single node; reserved for replication.
-    term: u64,
     /// Highest commit index published so far, mirrored for a lockless `index()`.
     index: AtomicU64,
     commits: AtomicU64,
@@ -173,43 +257,49 @@ impl std::fmt::Debug for Store {
         f.debug_struct("Store")
             .field("dir", &self.dir)
             .field("index", &self.index.load(Ordering::Acquire))
-            .field("term", &self.term)
             .finish()
     }
 }
 
 impl Store {
-    /// Open (or create) a store at `dir`, recovering from snapshot + WAL tail.
-    pub fn open(dir: impl AsRef<std::path::Path>) -> io::Result<Self> {
-        Self::open_with(dir, DEFAULT_MAX_SEG_BYTES)
+    /// Open the store in `dir`, creating the directory and an empty store if there is
+    /// none, and recover its state: the latest usable checkpoint plus the log written
+    /// since. Uses the default [`Options`].
+    pub fn open(dir: impl AsRef<Path>) -> io::Result<Store> {
+        Self::open_with(dir, Options::default())
     }
 
-    /// Open with a custom WAL segment-rotation size (tests use this to force turns).
-    pub fn open_with(dir: impl AsRef<std::path::Path>, max_seg_bytes: u64) -> io::Result<Self> {
-        let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
+    /// [`Store::open`] with explicit [`Options`].
+    pub fn open_with(dir: impl AsRef<Path>, options: Options) -> io::Result<Store> {
+        // A directory created here must survive a crash as surely as the data written
+        // into it, and its entry lives in its parent.
+        wal::create_dir_all_durably(dir.as_ref())?;
+        // Pin the directory: every later path (a new segment, a checkpoint, a deletion) is
+        // resolved from it, so a relative path must not follow the process's working
+        // directory, nor a symlink that is re-pointed while the store is open.
+        let dir = std::fs::canonicalize(dir.as_ref())?;
 
         // 0) Own the directory before touching it: recovery below truncates what looks
         //    like a torn tail, which in a live owner's log is an append in flight.
         let lock = lock_dir(&dir)?;
 
         // 1) Fast path: load the latest usable checkpoint, if any. First boot -> None.
-        let base = checkpoint::load(&dir)?;
+        let loaded = checkpoint::load(&dir)?;
+        let base = loaded.snapshot.unwrap_or_else(Snapshot::empty);
+        let (mut data, base_index) = (base.data, base.index);
 
-        // 2) Replay the WAL, applying only records strictly newer than the checkpoint.
-        //    A torn tail is the one append a crash interrupted: never acknowledged, so
-        //    never applied; `Wal::open` below truncates it so new appends start on a
-        //    clean boundary. Corruption anywhere else is an error, not something to skip.
-        let (records, _torn) = wal::replay(&dir)?;
-        let (mut data, base_index) = match base {
-            Some(s) => (s.data, s.index),
-            None => (Default::default(), 0),
-        };
+        // 2) Stream the WAL, applying only records strictly newer than the checkpoint. A
+        //    torn tail is the one append a crash interrupted: never acknowledged, so never
+        //    applied; `Wal::open` below truncates it so new appends start on a clean
+        //    boundary. Corruption anywhere else is an error, not something to skip.
         let mut last_index = base_index;
-        for r in records {
+        // The segment holding the first record the checkpoint does not cover: everything
+        // below it is covered, which is what lets the first checkpoint reclaim it.
+        let mut first_uncovered = None;
+        wal::replay(&dir, |segment, r| {
             if r.index <= last_index {
                 if last_index == base_index {
-                    continue; // at/below the checkpoint index: already reflected
+                    return Ok(()); // at/below the checkpoint index: already reflected
                 }
                 return Err(corrupt_log(format!(
                     "WAL record {} follows record {last_index}: the log is out of order",
@@ -230,12 +320,18 @@ impl Store {
                 op.apply(&mut data, r.index);
             }
             last_index = r.index;
-        }
+            first_uncovered.get_or_insert(segment);
+            Ok(())
+        })?;
 
         // 3) Resume the log. It is reclaimed by `checkpoint()`, never here: the recovered
         //    state is only in memory until a checkpoint re-persists it, so deleting the
-        //    log at open would turn the next crash into data loss.
-        let wal = Wal::open(&dir, max_seg_bytes)?;
+        //    log at open would turn the next crash into data loss. The next checkpoint
+        //    retains the loaded one as `snap.prev` (or keeps it there, after a fall-back),
+        //    so it may reclaim every segment below the first uncovered record -- or below
+        //    the current segment, if the checkpoint covers the whole log.
+        let wal = Wal::open(&dir, options.wal_segment_size)?;
+        let prev_boundary = first_uncovered.unwrap_or_else(|| wal.current_segment());
 
         // 4) Publish the recovered state as the initial authoritative snapshot.
         Ok(Store {
@@ -251,9 +347,9 @@ impl Store {
             }),
             wal: Mutex::new(wal),
             ckpt: Mutex::new(CheckpointState {
-                prev_boundary: None,
+                prev_boundary,
+                latest_damaged: loaded.latest_damaged,
             }),
-            term: 1,
             index: AtomicU64::new(last_index),
             commits: AtomicU64::new(0),
             wal_syncs: AtomicU64::new(0),
@@ -262,12 +358,8 @@ impl Store {
         })
     }
 
-    /// Current term. Always `1` on a single node.
-    pub fn term(&self) -> u64 {
-        self.term
-    }
-
-    /// The highest commit index published so far.
+    /// The highest commit index published so far: the index of the latest acknowledged
+    /// commit, or 0 for a store that has never been written.
     pub fn index(&self) -> u64 {
         self.index.load(Ordering::Acquire)
     }
@@ -299,7 +391,8 @@ impl Store {
         }])
     }
 
-    /// Delete `key`, durable and linearised. Returns the commit index.
+    /// Delete `key`, durable and linearised. Returns the commit index. Deleting an absent
+    /// key is still a commit, and changes nothing.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> io::Result<u64> {
         self.commit_ops(vec![Op::Delete {
             key: key.as_ref().to_vec(),
@@ -310,7 +403,7 @@ impl Store {
     /// under a crash (the record's CRC covers every op), and visible at once. Ops apply
     /// in order, so a later op in the batch sees an earlier one. An empty batch commits
     /// nothing and returns the current index.
-    pub fn put_batch(&self, ops: impl IntoIterator<Item = Op>) -> io::Result<u64> {
+    pub fn apply_batch(&self, ops: impl IntoIterator<Item = Op>) -> io::Result<u64> {
         let ops: Vec<Op> = ops.into_iter().collect();
         if ops.is_empty() {
             return Ok(self.index());
@@ -318,46 +411,34 @@ impl Store {
         self.commit_ops(ops)
     }
 
-    /// Read `key` from a freshly-loaded snapshot. `None` means absent/deleted.
+    /// The value of `key`, or `None` if it is absent (never written, or deleted).
     ///
-    /// This is the lock-free read fast path: no commit lock, just an RCU load.
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.snap.load().get(key).map(|e| e.value.to_vec())
+    /// Served from the latest snapshot, without touching the commit path.
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Option<Vec<u8>> {
+        self.snap.load().get(key).map(<[u8]>::to_vec)
     }
 
-    /// Read `key` with its per-key commit index (its "version").
-    ///
-    /// The primitive MVCC / historical reads build on: the index of the *write* that
-    /// produced the current value.
-    pub fn get_with_index(&self, key: &[u8]) -> Option<(Vec<u8>, u64)> {
+    /// The value of `key` together with its *version*: the commit index of the write that
+    /// produced it (see [`Snapshot::get_with_version`]).
+    pub fn get_with_version(&self, key: impl AsRef<[u8]>) -> Option<(Vec<u8>, u64)> {
         self.snap
             .load()
-            .get(key)
-            .map(|e| (e.value.to_vec(), e.version))
+            .get_with_version(key)
+            .map(|(value, version)| (value.to_vec(), version))
     }
 
-    /// Point read together with the **snapshot index** the value was observed at,
-    /// i.e. the MVCC read point `(value_or_none, snapshot_index)`. A concurrent
-    /// reader may observe an older snapshot than the leader; the checker uses that
-    /// index to validate the observed value deterministically.
-    pub fn get_at(&self, key: &[u8]) -> (Option<Vec<u8>>, u64) {
-        let snap = self.snap.load();
-        (snap.get(key).map(|e| e.value.to_vec()), snap.index)
-    }
-
-    /// Snapshot-consistent prefix scan: live keys with the given prefix, byte order.
+    /// Every live key that starts with `prefix`, and its value, in byte order, from one
+    /// snapshot.
     pub fn scan(&self, prefix: impl AsRef<[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.snap
             .load()
-            .scan_prefix(prefix.as_ref())
-            .into_iter()
-            .map(|(k, e)| (k.to_vec(), e.value.to_vec()))
+            .scan(prefix)
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect()
     }
 
-    /// Snapshot-consistent ordered range scan over `[lo, hi)`: `lo` inclusive, `hi`
-    /// exclusive, empty when `lo >= hi`. Served in O(log n + k) straight from the
-    /// snapshot's ordered map, like every other read: no extra index, no extra lock.
+    /// Every live key in the half-open range `[lo, hi)`, and its value, in byte order,
+    /// from one snapshot; empty when `lo >= hi`.
     pub fn range_scan(
         &self,
         lo: impl AsRef<[u8]>,
@@ -365,10 +446,33 @@ impl Store {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.snap
             .load()
-            .range(lo.as_ref(), hi.as_ref())
-            .into_iter()
-            .map(|(k, e)| (k.to_vec(), e.value.to_vec()))
+            .range_scan(lo, hi)
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect()
+    }
+
+    /// The latest snapshot: a consistent, point-in-time view of every key, for reads that
+    /// must agree with each other. It is unaffected by later writes, costs one reference
+    /// count to take, and never blocks a writer however long it is held (though it keeps
+    /// the data it references alive).
+    ///
+    /// ```
+    /// # fn main() -> std::io::Result<()> {
+    /// # let dir = std::env::temp_dir().join(format!("keystory-doc-snapshot-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let store = keystory::Store::open(&dir)?;
+    /// store.put("stock:apples", "3")?;
+    /// let view = store.snapshot();
+    /// store.put("stock:apples", "2")?;
+    /// assert_eq!(view.get("stock:apples"), Some(&b"3"[..])); // as of the snapshot
+    /// assert_eq!(view.index() + 1, store.index());
+    /// # drop(store);
+    /// # std::fs::remove_dir_all(&dir)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.snap.load()
     }
 
     // ---- core commit path ----
@@ -450,7 +554,7 @@ impl Store {
                 op.apply(&mut data, index);
             }
             records.push(Record {
-                term: self.term,
+                term: SINGLE_NODE_TERM,
                 index,
                 ops: p.ops.clone(),
             });
@@ -476,11 +580,11 @@ impl Store {
     /// Durably checkpoint the current state and reclaim the WAL it makes redundant.
     ///
     /// Excludes flushes only for the instant it takes to pin the snapshot and rotate the
-    /// WAL, so writers keep committing while the snapshot file is written. The previous checkpoint is
-    /// retained as `snap.prev`; the segments *it* covered are deleted now, and the
-    /// segments this one covers survive until the next checkpoint -- so a fall-back to
-    /// `snap.prev` always has a complete log to replay. Checkpoints are serialised with
-    /// each other. Returns the commit index reflected in the checkpoint.
+    /// WAL, so writers keep committing while the snapshot file is written. The previous
+    /// checkpoint is retained as `snap.prev`; the segments *it* covered are deleted now,
+    /// and the segments this one covers survive until the next checkpoint -- so a
+    /// fall-back to `snap.prev` always has a complete log to replay. Checkpoints are
+    /// serialised with each other. Returns the commit index reflected in the checkpoint.
     pub fn checkpoint(&self) -> io::Result<u64> {
         let mut state = self.ckpt.lock().expect("checkpoint lock poisoned");
         let (cur, boundary) = {
@@ -493,14 +597,23 @@ impl Store {
                 .rotate_segment()?;
             (cur, boundary)
         };
-        checkpoint::write(&self.dir, &cur)?; // durable tmp + fsync + renames; writers run meanwhile
+        // After a fall-back recovery `snap.dat` is the damaged file: replace it, and never
+        // demote it over the good `snap.prev` that recovery used.
+        let replaced = if state.latest_damaged {
+            Replaced::Discard
+        } else {
+            Replaced::Retain
+        };
+        checkpoint::write(&self.dir, &cur, replaced)?; // writers run meanwhile
+        state.latest_damaged = false;
         self.checkpoints.fetch_add(1, Ordering::Relaxed);
-        if let Some(prev) = state.prev_boundary.replace(boundary) {
-            self.wal
-                .lock()
-                .expect("wal lock poisoned")
-                .remove_segments_before(prev)?;
-        }
+        // Every segment below the old boundary holds only records the checkpoint now
+        // retained as `snap.prev` covers; the new boundary is for the next checkpoint.
+        let covered = std::mem::replace(&mut state.prev_boundary, boundary);
+        self.wal
+            .lock()
+            .expect("wal lock poisoned")
+            .remove_segments_before(covered)?;
         Ok(cur.index)
     }
 }
@@ -536,9 +649,9 @@ fn corrupt_log(msg: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
 
-    /// A unique temp dir per test, removed on drop (even when the test panics).
+    /// A unique temp dir per test, removed on drop (even when the test panics). Not
+    /// created: `Store::open` creates it.
     struct TmpDir(PathBuf);
 
     impl TmpDir {
@@ -567,15 +680,20 @@ mod tests {
 
     fn tmp_store(suffix: &str, max_seg: u64) -> (TmpDir, Store) {
         let d = TmpDir::new(suffix);
-        let s = Store::open_with(d.path(), max_seg).expect("open store");
+        let s = Store::open_with(d.path(), Options::new().wal_segment_size(max_seg))
+            .expect("open store");
         (d, s)
     }
 
     fn put(k: &str, v: &str) -> Op {
-        Op::Put {
-            key: k.as_bytes().to_vec(),
-            value: v.as_bytes().to_vec(),
-        }
+        Op::put(k, v)
+    }
+
+    fn corrupt(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(path, &bytes).unwrap();
     }
 
     #[test]
@@ -585,7 +703,7 @@ mod tests {
         assert_eq!(s.put(b"k", b"v").unwrap(), 1, "first commit is index 1");
         assert_eq!(s.get(b"k"), Some(b"v".to_vec()));
         assert_eq!(
-            s.get_with_index(b"k").unwrap().1,
+            s.get_with_version(b"k").unwrap().1,
             1,
             "version = commit index"
         );
@@ -618,14 +736,33 @@ mod tests {
         assert_eq!(got, vec![b"aa".to_vec(), b"ab".to_vec(), b"ac".to_vec()]);
     }
 
+    /// A snapshot is one point in the commit order: later writes do not reach it, every
+    /// read on it agrees with every other, and it names the index it reflects.
     #[test]
-    fn get_at_reports_snapshot_index() {
-        let (_d, s) = tmp_store("getat", 1 << 20);
-        s.put(b"k", b"1").unwrap();
-        s.put(b"k", b"2").unwrap();
-        let (val, snap_idx) = s.get_at(b"k");
-        assert_eq!(val, Some(b"2".to_vec()));
-        assert!(snap_idx >= 2, "read observed a snapshot >= the 2nd commit");
+    fn a_snapshot_is_a_consistent_point_in_time_view() {
+        let (_d, s) = tmp_store("snapshot-view", 1 << 20);
+        s.put("a", "1").unwrap();
+        s.put("b", "2").unwrap();
+        let view = s.snapshot();
+        s.put("a", "changed").unwrap();
+        s.delete("b").unwrap();
+        s.put("c", "3").unwrap();
+
+        assert_eq!(view.index(), 2);
+        assert_eq!(view.get("a"), Some(&b"1"[..]));
+        assert_eq!(view.get_with_version("b"), Some((&b"2"[..], 2)));
+        assert_eq!(view.get("c"), None);
+        assert_eq!(
+            view.iter().collect::<Vec<_>>(),
+            vec![(&b"a"[..], &b"1"[..]), (&b"b"[..], &b"2"[..])]
+        );
+        let now = s.snapshot();
+        assert_eq!((now.index(), now.len()), (5, 2));
+        assert_eq!(
+            now.range_scan("a", "z").map(|(k, _)| k).collect::<Vec<_>>(),
+            vec![&b"a"[..], &b"c"[..]]
+        );
+        assert_eq!(s.get_with_version("a"), Some((b"changed".to_vec(), 3)));
     }
 
     #[test]
@@ -717,7 +854,7 @@ mod tests {
         );
         let loaded = checkpoint::load(d.path()).unwrap();
         assert_eq!(
-            loaded.map(|s| s.len()),
+            loaded.snapshot.map(|s| s.len()),
             Some(60),
             "latest snapshot covers 60 keys"
         );
@@ -725,6 +862,38 @@ mod tests {
         let fresh = Store::open(d.path()).unwrap();
         assert_eq!(fresh.len(), 60, "recovered from snapshot");
         assert_eq!(fresh.stats().checkpoints, 0, "stats are per open");
+    }
+
+    /// Regression (pre-release review, second pass): only the second checkpoint of a
+    /// process reclaimed anything, because the boundary it needed was forgotten at every
+    /// open -- so a process that checkpointed once per run never reclaimed its log (probe:
+    /// 4, 7, 10, ... 19 segments over six runs, and every open read all of them). Recovery
+    /// now works the boundary out, and the log stays bounded run after run.
+    #[test]
+    fn one_checkpoint_per_open_still_reclaims_the_log() {
+        let d = TmpDir::new("reclaim-per-open");
+        let mut segments = Vec::new();
+        for run in 0..6 {
+            let s = Store::open_with(d.path(), Options::new().wal_segment_size(4096)).unwrap();
+            for i in 0..200 {
+                s.put(format!("run{run}-k{i:03}"), "value").unwrap();
+            }
+            s.checkpoint().unwrap();
+            drop(s);
+            segments.push(wal::list_segments(d.path()).unwrap().len());
+        }
+        assert!(
+            segments[5] <= segments[1],
+            "the log grows run after run: {segments:?} segments"
+        );
+        let s = Store::open(d.path()).unwrap();
+        assert_eq!((s.len(), s.index()), (1200, 1200), "and nothing was lost");
+        drop(s);
+
+        // A fall-back to the retained generation still finds every record it needs.
+        std::fs::remove_file(d.path().join(checkpoint::SNAPSHOT_NAME)).unwrap();
+        let s = Store::open(d.path()).expect("snap.prev plus the log kept since it");
+        assert_eq!((s.len(), s.index()), (1200, 1200));
     }
 
     /// Regression (Phase 6): opening a store must never discard the WAL. Two reopens
@@ -793,22 +962,18 @@ mod tests {
 
     /// A batch is one commit: one index, one record, visible at once, and recoverable.
     #[test]
-    fn put_batch_is_one_commit() {
+    fn a_batch_is_one_commit() {
         let (d, s) = tmp_store("batch", 1 << 20);
         s.put(b"c", b"old").unwrap();
         let idx = s
-            .put_batch([
-                put("a", "1"),
-                put("b", "2"),
-                Op::Delete { key: b"c".to_vec() },
-            ])
+            .apply_batch([put("a", "1"), put("b", "2"), Op::delete("c")])
             .unwrap();
         assert_eq!(idx, 2, "the batch took exactly one index");
         assert_eq!(s.index(), 2);
         assert_eq!(s.get(b"a"), Some(b"1".to_vec()));
-        assert_eq!(s.get_with_index(b"b"), Some((b"2".to_vec(), 2)));
+        assert_eq!(s.get_with_version(b"b"), Some((b"2".to_vec(), 2)));
         assert_eq!(s.get(b"c"), None);
-        assert_eq!(s.put_batch([]).unwrap(), 2, "an empty batch is a no-op");
+        assert_eq!(s.apply_batch([]).unwrap(), 2, "an empty batch is a no-op");
         assert_eq!(s.stats().commits, 2);
         drop(s);
         let s = Store::open(d.path()).unwrap();
@@ -828,7 +993,7 @@ mod tests {
             segs.sort();
             (segs[0].clone(), std::fs::metadata(&segs[0]).unwrap().len())
         };
-        s.put_batch([put("b", "2"), put("c", "3")]).unwrap();
+        s.apply_batch([put("b", "2"), put("c", "3")]).unwrap();
         drop(s);
         // Chop the batch record in half, as a crash mid-write would.
         let (seg, clean) = before;
@@ -963,11 +1128,7 @@ mod tests {
             s.put(format!("k{i:02}"), b"3").unwrap();
         }
         drop(s);
-        let latest = d.path().join(checkpoint::SNAPSHOT_NAME);
-        let mut bytes = std::fs::read(&latest).unwrap();
-        let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xFF;
-        std::fs::write(&latest, &bytes).unwrap();
+        corrupt(&d.path().join(checkpoint::SNAPSHOT_NAME));
 
         let s = Store::open(d.path()).expect("recovers via snap.prev + WAL");
         assert_eq!(
@@ -978,6 +1139,46 @@ mod tests {
         assert_eq!(s.index(), 25);
         assert_eq!(s.get(b"k15"), Some(b"2".to_vec()));
         assert_eq!(s.get(b"k24"), Some(b"3".to_vec()));
+    }
+
+    /// Regression (pre-release review): the first checkpoint after a fall-back recovery
+    /// renamed the damaged `snap.dat` over the good `snap.prev`, so a crash before it
+    /// published the new checkpoint left the store unopenable (probe: "crc mismatch" on
+    /// every later open). Now the damaged file is replaced in place: even with the new
+    /// checkpoint lost, the good generation and the WAL kept since it recover everything.
+    #[test]
+    fn a_checkpoint_after_a_fallback_keeps_the_good_generation() {
+        let (d, s) = tmp_store("fallback-ckpt", 1 << 20);
+        for i in 0..10 {
+            s.put(format!("a{i}"), b"1").unwrap();
+        }
+        s.checkpoint().unwrap(); // index 10
+        for i in 0..10 {
+            s.put(format!("b{i}"), b"2").unwrap();
+        }
+        s.checkpoint().unwrap(); // snap.dat at 20, snap.prev at 10
+        for i in 0..5 {
+            s.put(format!("c{i}"), b"3").unwrap();
+        }
+        drop(s);
+        corrupt(&d.path().join(checkpoint::SNAPSHOT_NAME));
+
+        let s = Store::open(d.path()).expect("falls back to snap.prev + WAL");
+        assert_eq!((s.len(), s.index()), (25, 25));
+        assert_eq!(s.checkpoint().unwrap(), 25);
+        drop(s);
+
+        let latest = checkpoint::load(d.path()).unwrap();
+        assert_eq!(
+            latest.snapshot.map(|s| s.index),
+            Some(25),
+            "the new checkpoint"
+        );
+        // As if a crash had struck before the new checkpoint was published:
+        std::fs::remove_file(d.path().join(checkpoint::SNAPSHOT_NAME)).unwrap();
+        let s = Store::open(d.path()).expect("the good generation survived the checkpoint");
+        assert_eq!((s.len(), s.index()), (25, 25));
+        assert_eq!(s.get("c4"), Some(b"3".to_vec()));
     }
 
     /// Regression (2026-09-26 audit): recovery used to apply whatever records it found
@@ -1006,7 +1207,7 @@ mod tests {
             std::fs::create_dir_all(d.path()).unwrap();
             let mut snap = Snapshot::empty();
             snap.index = 5;
-            checkpoint::write(d.path(), &snap).unwrap();
+            checkpoint::write(d.path(), &snap, Replaced::Retain).unwrap();
             write_log(d.path(), log);
             Store::open(d.path()).map(|s| s.index())
         };
@@ -1027,6 +1228,37 @@ mod tests {
         drop(s);
         let s = Store::open(d.path()).expect("the lock is released on drop");
         assert_eq!(s.len(), 2);
+    }
+
+    /// Regression (pre-release review): `open` created a missing store directory without
+    /// syncing its parent, so after a power cut the directory -- and every acknowledged
+    /// write inside it -- could vanish, though each write had been `fsync`'d. Every
+    /// directory `open` creates is now synced into its parent, outermost first.
+    #[test]
+    fn creating_a_store_syncs_every_new_directory_entry() {
+        let root = TmpDir::new("durable-dirs");
+        let dir = root.path().join("a").join("b");
+        wal::SYNCED_DIRS.with(|synced| synced.borrow_mut().clear());
+        let s = Store::open(&dir).unwrap();
+        let synced = wal::SYNCED_DIRS.with(|synced| synced.borrow().clone());
+        let parents = [
+            root.path().parent().unwrap().to_path_buf(),
+            root.path().to_path_buf(),
+            root.path().join("a"),
+        ];
+        let at: Vec<usize> = parents
+            .iter()
+            .map(|p| {
+                synced
+                    .iter()
+                    .position(|s| s == p)
+                    .unwrap_or_else(|| panic!("{} was never synced: {synced:?}", p.display()))
+            })
+            .collect();
+        assert!(at.is_sorted(), "outermost first: {at:?}");
+        s.put("k", "v").unwrap();
+        drop(s);
+        assert_eq!(Store::open(&dir).unwrap().get("k"), Some(b"v".to_vec()));
     }
 
     /// A commit whose WAL append fails is not published, and a log that cannot roll the
@@ -1058,6 +1290,23 @@ mod tests {
             "every acknowledged write recovered"
         );
         assert_eq!(s.put(b"k5", b"v").unwrap(), 6, "and the index resumes");
+    }
+
+    /// A store in another format version is refused with `Unsupported` at open, before
+    /// anything is changed on disk.
+    #[test]
+    fn a_store_in_another_format_version_is_refused() {
+        let (d, s) = tmp_store("format", 1 << 20);
+        s.put("k", "v").unwrap();
+        drop(s);
+        let seg = wal::list_segments(d.path()).unwrap().remove(0);
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let newer = wal::header_for(wal::SEGMENT_VERSION + 1);
+        bytes[..newer.len()].copy_from_slice(&newer);
+        std::fs::write(&seg, &bytes).unwrap();
+        let err = Store::open(d.path()).expect_err("a newer format");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        assert_eq!(std::fs::read(&seg).unwrap(), bytes, "left as it was");
     }
 
     #[test]
